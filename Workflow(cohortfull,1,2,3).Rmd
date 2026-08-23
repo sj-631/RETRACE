@@ -1,0 +1,2280 @@
+---
+title: "eGFR workflow"
+author: "Shen Jia"
+date: "2026-07-01"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+Install the packages needed in the research. Define the functions included in the research
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Change only these paths when moving the analysis.
+data_path <- "/Users/shenjia/Downloads/harmonized data with biopsy.csv"
+output_dir <- file.path(getwd(), "egfr_output")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+required_packages <- c(
+  "dplyr", "tidyr", "ggplot2", "nlme", "lspline",
+  "stringr", "kml", "cmprsk", "scales", "patchwork"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages)) {
+  stop("Install missing packages: ", paste(missing_packages, collapse = ", "))
+}
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+group_cols <- c("Recovered group" = "#0072B2", "Static group" = "#D55E00")
+induction_cols <- c(
+  "Cyclophosphamide" = "#0072B2",
+  "Rituximab" = "#D55E00",
+  "Other" = "#009E73"
+)
+berden_levels <- c("Focal", "Crescentic", "Mixed", "Sclerotic", "Missing")
+berden_cols <- c(
+  "Focal" = "#1a9850", "Crescentic" = "#66bd63",
+  "Mixed" = "#fdae61", "Sclerotic" = "#d73027", "Missing" = "grey70"
+)
+
+num_clean <- function(x) suppressWarnings(as.numeric(as.character(x)))
+date_clean <- function(x) suppressWarnings(as.Date(as.character(x)))
+
+standardize_berden <- function(x) {
+  x <- trimws(as.character(x))
+  x[is.na(x) | x %in% c("", "NA", "N/A", "na", "n/a")] <- "Missing"
+  x
+}
+
+checked_label <- function(x, label) {
+  x <- as.character(x)
+  x[x == "Checked"] <- label
+  x[x == "Unchecked"] <- " "
+  x
+}
+
+collapse_checked <- function(x) {
+  x <- trimws(as.character(x))
+  if (any(x == "Checked", na.rm = TRUE)) "Checked" else
+    if (all(is.na(x) | x == "")) NA_character_ else "Unchecked"
+}
+
+first_nonblank <- function(x) {
+  keep <- !is.na(x) & trimws(as.character(x)) != ""
+  if (any(keep)) x[which(keep)[1]] else x[NA_integer_][1]
+}
+first_valid_date <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x)) x[1] else as.Date(NA_character_)
+}
+
+first_finite <- function(x) {
+  x <- num_clean(x)
+  x <- x[is.finite(x)]
+  if (length(x)) x[1] else NA_real_
+}
+
+assert_columns <- function(data, columns, object_name = deparse(substitute(data))) {
+  missing <- setdiff(columns, names(data))
+  if (length(missing)) {
+    stop(object_name, " is missing: ", paste(missing, collapse = ", "))
+  }
+  invisible(data)
+}
+
+save_plot <- function(plot, filename, width, height, dpi = 600) {
+  path <- file.path(output_dir, filename)
+  ggplot2::ggsave(path, plot, width = width, height = height, dpi = dpi, bg = "white")
+  if (!file.exists(path) || is.na(file.info(path)$size) || file.info(path)$size <= 0) {
+    stop("Figure was not saved correctly: ", path)
+  }
+  invisible(path)
+}
+
+save_table <- function(x, filename) {
+  path <- file.path(output_dir, filename)
+  write.csv(x, path, row.names = FALSE)
+  invisible(path)
+}
+
+theme_manuscript <- function(base_size = 13, legend = "bottom") {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(colour = "black"),
+      panel.grid.major.y = element_line(colour = "grey90", linewidth = 0.35),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = legend
+    )
+}
+
+format_p <- function(p, prefix = FALSE) {
+  label <- ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+  if (prefix) paste("P", ifelse(p < 0.001, label, paste("=", label))) else label
+}
+
+wilcox_p <- function(x, group) {
+  keep <- !is.na(x) & !is.na(group)
+  x <- x[keep]
+  group <- droplevels(factor(group[keep]))
+  if (nlevels(group) != 2 || length(unique(x)) < 2) return(NA_real_)
+  wilcox.test(x ~ group, exact = FALSE)$p.value
+}
+
+fisher_p <- function(x, group) {
+  keep <- !is.na(x) & !is.na(group)
+  tab <- table(group[keep], x[keep])
+  if (nrow(tab) != 2 || ncol(tab) < 2) return(NA_real_)
+  fisher.test(tab)$p.value
+}
+
+tidy_cuminc <- function(fit, event_code = 1L, population = NULL) {
+  curve_names <- setdiff(names(fit), "Tests")
+  curve_names <- curve_names[grepl(paste0("(^| )", event_code, "$"), curve_names)]
+  if (!length(curve_names)) stop("No CIF curve found for event code ", event_code)
+
+  bind_rows(lapply(curve_names, function(curve_name) {
+    curve <- fit[[curve_name]]
+    data.frame(
+      name = curve_name,
+      time = curve$time,
+      estimate = curve$est,
+      variance = curve$var
+    )
+  })) %>%
+    mutate(
+      population = population,
+      group = sub(paste0(" ?", event_code, "$"), "", name),
+      se = sqrt(pmax(variance, 0)),
+      lower = pmax(estimate - 1.96 * se, 0),
+      upper = pmin(estimate + 1.96 * se, 1)
+    )
+}
+
+fine_gray_stats <- function(fit, term = 1L) {
+  beta <- unname(fit$coef[term])
+  se <- sqrt(fit$var[term, term])
+  tibble(
+    beta = beta,
+    SHR = exp(beta),
+    lower = exp(beta - 1.96 * se),
+    upper = exp(beta + 1.96 * se),
+    p = 2 * pnorm(-abs(beta / se))
+  )
+}
+
+predict_fixed_lme <- function(model, newdata) {
+  design <- model.matrix(delete.response(terms(model)), newdata)
+  beta <- nlme::fixef(model)
+  covariance <- vcov(model)
+  if (!setequal(colnames(design), names(beta))) {
+    stop("Prediction design matrix does not match the model coefficients.")
+  }
+  design <- design[, names(beta), drop = FALSE]
+  estimate <- as.numeric(design %*% beta)
+  se <- sqrt(rowSums((design %*% covariance) * design))
+  critical <- qt(0.975, df = nobs(model) - length(beta))
+  bind_cols(
+    as_tibble(newdata),
+    tibble(
+      fit = estimate,
+      lower = estimate - critical * se,
+      upper = estimate + critical * se
+    )
+  )
+}
+
+extract_cif_times <- function(curve_data, times = c(1, 3, 5)) {
+  bind_rows(lapply(unique(curve_data$population), function(population_value) {
+    curve <- curve_data %>% filter(population == population_value) %>% arrange(time)
+    bind_rows(lapply(times, function(target_time) {
+      idx <- which(curve$time <= target_time)
+      if (!length(idx)) {
+        return(tibble(
+          population = population_value, year = target_time,
+          estimate = 0, lower = 0, upper = 0
+        ))
+      }
+      row <- curve[max(idx), ]
+      tibble(
+        population = population_value, year = target_time,
+        estimate = row$estimate, lower = row$lower, upper = row$upper
+      )
+    }))
+  }))
+}
+```
+
+## 1. Load, filter, and clean the data 
+Select the variable of interest to the research. Full Cohort 
+
+```{r load-filter-clean}
+raw_data <- read.csv(data_path, stringsAsFactors = FALSE, check.names = TRUE)
+
+disease_labels <- c(
+  "Granulomatosis with polyangiitis (Wegener) - Orpha:900",
+  "Microscopic polyangiitis (including renal limited vasculitis) - ORPHA:727"
+)
+
+exRKD <- raw_data %>%
+  filter(
+    diagnosis_confidence == "Definite",
+    small_vessel_vas_anca %in% disease_labels,
+    Secondary.vasculitis != "Yes",
+    Other != "Yes",
+    is.na(Medium.vessel.vasculitis) | Medium.vessel.vasculitis == "",
+    is.na(Large.vessel.vasculitis) | Large.vessel.vasculitis == "",
+    is.na(Variable.vessel.vasculitis) | Variable.vessel.vasculitis == "",
+    is.na(small_vessel_vas_immune) |
+      small_vessel_vas_immune %in% c("", "Anti-GBM disease - ORPHA:375")
+  ) %>%
+  mutate(
+    inductiontreatmentType_Rituximab = checked_label(
+      inductiontreatmentType_Rituximab, "Rituximab"
+    ),
+    inductiontreatmentType_Cyclophosphamide = checked_label(
+      inductiontreatmentType_Cyclophosphamide, "Cyclo.P"
+    ),
+    inductiontreatmentType_.Daily.Oral.Cyclophosphamide = checked_label(
+      inductiontreatmentType_.Daily.Oral.Cyclophosphamide, "Cyclo.O"
+    ),
+    inductiontreatmentType_.Pulsed.IV.corticosteroids = checked_label(
+      inductiontreatmentType_.Pulsed.IV.corticosteroids, "IV.Steroids"
+    ),
+    inductiontreatmentType_Oral.corticosteroids = checked_label(
+      inductiontreatmentType_Oral.corticosteroids, "Oral.Steroids"
+    ),
+    cyclo = if_else(
+      inductiontreatmentType_.Daily.Oral.Cyclophosphamide == "Cyclo.O" |
+        inductiontreatmentType_Cyclophosphamide == "Cyclo.P",
+      "Cyclo", " "
+    ),
+    corti = if_else(
+      inductiontreatmentType_Oral.corticosteroids == "Oral.Steroids" |
+        inductiontreatmentType_.Pulsed.IV.corticosteroids == "IV.Steroids",
+      "Corti", " "
+    ),
+    corti_seperate = str_c(
+      inductiontreatmentType_Oral.corticosteroids, ";",
+      inductiontreatmentType_.Pulsed.IV.corticosteroids
+    ),
+    induction_trtmnt = str_c(inductiontreatmentType_Rituximab, " ", cyclo),
+    inductionFinal = trimws(induction_trtmnt),
+    inductionFinal = if_else(
+      inductionFinal %in% c("Cyclo", "Rituximab"), inductionFinal, "Other"
+    ),
+    Berden.score.on.renal.biopsy = standardize_berden(
+      Berden.score.on.renal.biopsy
+    ),
+    ancaSpec = if_else(ancaSpec %in% c("MPO", "PR3"), ancaSpec, "Other")
+  )
+
+organ_cols <- c(
+  "affectedOrgan_Renal", "affectedOrgan_Cutaneous", "affectedOrgan_General",
+  "affectedOrgan_Abdominal", "affectedOrgan_Mucous_membranes_eyes",
+  "affectedOrgan_Cardiovascular", "affectedOrgan_Other", "affectedOrgan_ENT",
+  "affectedOrgan_Chest", "affectedOrgan_Nervous_system"
+)
+core_cols <- c(
+  "RKD.ID", "creatininetest", "egfr_calculated", "dateOfDiagnosis",
+  "Interval.from.diagnosis..months.", "Date.Of.Visit", "Dialysis.dependent",
+  "Berden.score.on.renal.biopsy", "dateOfDeath", "dateOfESKD", "ancaSpec",
+  "gender", "DefiniteGPA", "DefiniteMPA", "ESKDStandard",
+  "lastRecordedContact", "death", "ageAtDiagnosis", "inductionFinal",
+  "inductiontreatmentType_.Pulsed.IV.corticosteroids",
+  "inductiontreatmentType_Oral.corticosteroids",
+  "inductiontreatmentType_Plasma.exchange",
+  "inductiontreatmentType_Methotrexate",
+  "inductiontreatmentType_Rituximab", "cyclo"
+)
+needed_cols <- unique(c(core_cols, organ_cols))
+assert_columns(exRKD, needed_cols)
+
+renal_raw <- exRKD %>%
+  select(all_of(needed_cols)) %>%
+  mutate(
+    across(c(creatininetest, egfr_calculated, Interval.from.diagnosis..months.), num_clean),
+    across(c(Date.Of.Visit, dateOfDiagnosis, dateOfDeath, dateOfESKD,
+             lastRecordedContact), date_clean),
+    Dialysis.dependent = trimws(as.character(Dialysis.dependent)),
+    Dialysis.dependent = if_else(
+      is.na(Dialysis.dependent) | Dialysis.dependent == "", "No", Dialysis.dependent
+    ),
+    Diagnosis = case_when(
+      DefiniteMPA == 1 ~ "MPA",
+      DefiniteGPA == 1 ~ "GPA",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Organ fields are summarized separately so that patient-level collapsing does
+# not alter the visit-level renal filter used in the original ECT workflow.
+organ_summary <- renal_raw %>%
+  group_by(RKD.ID) %>%
+  summarise(across(all_of(organ_cols), collapse_checked), .groups = "drop") %>%
+  summarise(across(all_of(organ_cols), ~ sum(.x == "Checked", na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "Organ", values_to = "n_checked")
+
+cat("Original IDs:", n_distinct(raw_data$RKD.ID), "\n")
+cat("Filtered AAV IDs:", n_distinct(renal_raw$RKD.ID), "\n")
+print(organ_summary)
+```
+
+## 2. Derive Early renal recovery cohort (Cohort 1)
+
+```{r cohort-derivation}
+Full_cohort <- renal_raw
+
+# Full-cohort baseline rule: earliest value in [-0.5, 1] months; if absent,
+# use the earliest dated value anywhere. This intentionally differs from ECT.
+baseline_values <- Full_cohort %>%
+  group_by(RKD.ID) %>%
+  group_modify(~ {
+    time <- .x$Interval.from.diagnosis..months.
+    preferred <- !is.na(time) & time >= -0.5 & time <= 1
+    if (any(preferred)) {
+      .x[preferred, ] %>% arrange(Interval.from.diagnosis..months.) %>% slice(1)
+    } else if (any(!is.na(time))) {
+      .x %>%
+        filter(!is.na(Interval.from.diagnosis..months.)) %>%
+        arrange(Interval.from.diagnosis..months.) %>%
+        slice(1)
+    } else {
+      slice(.x, 1)
+    }
+  }) %>%
+  ungroup() %>%
+  select(
+    RKD.ID,
+    creatininetest1 = creatininetest,
+    egfr_calculated1 = egfr_calculated
+  )
+
+Full_cohort <- Full_cohort %>% left_join(baseline_values, by = "RKD.ID")
+
+# ECT source: renal visits in the first six months. Dialysis-dependent visits
+# are assigned eGFR=3 and creatinine=500 before baseline and change calculation.
+crtn <- renal_raw %>%
+  filter(
+    affectedOrgan_Renal == "Checked",
+    !is.na(Date.Of.Visit),
+    !is.na(Interval.from.diagnosis..months.),
+    Interval.from.diagnosis..months. > -0.5,
+    Interval.from.diagnosis..months. <= 6
+  ) %>%
+  mutate(
+    egfr_calculated = if_else(Dialysis.dependent == "Yes", 3, egfr_calculated),
+    creatininetest = if_else(Dialysis.dependent == "Yes", 500, creatininetest)
+  ) %>%
+  filter(is.finite(egfr_calculated)) %>%
+  arrange(RKD.ID, Date.Of.Visit, Interval.from.diagnosis..months.) %>%
+  distinct(RKD.ID, Date.Of.Visit, .keep_all = TRUE) %>%
+  arrange(RKD.ID, Interval.from.diagnosis..months.)
+
+# ECT baseline rule: earliest value at 0-1 month; otherwise the closest value
+# before diagnosis in (-0.5, 0). Do not merge this with the full-cohort rule.
+baseline_post <- crtn %>%
+  filter(between(Interval.from.diagnosis..months., 0, 1)) %>%
+  arrange(RKD.ID, Interval.from.diagnosis..months.) %>%
+  distinct(RKD.ID, .keep_all = TRUE)
+
+baseline_pre <- crtn %>%
+  filter(
+    !RKD.ID %in% baseline_post$RKD.ID,
+    Interval.from.diagnosis..months. > -0.5,
+    Interval.from.diagnosis..months. < 0
+  ) %>%
+  arrange(RKD.ID, desc(Interval.from.diagnosis..months.)) %>%
+  distinct(RKD.ID, .keep_all = TRUE)
+
+crtn_start <- bind_rows(baseline_post, baseline_pre) %>%
+  distinct(RKD.ID, .keep_all = TRUE) %>%
+  transmute(
+    RKD.ID,
+    creatininetest1 = creatininetest,
+    eGFR1 = egfr_calculated
+  )
+
+baseline_eGFR_status <- Full_cohort %>%
+  distinct(RKD.ID) %>%
+  mutate(has_baseline_eGFR = RKD.ID %in% crtn_start$RKD.ID)
+
+crtn <- crtn %>%
+  inner_join(crtn_start, by = "RKD.ID") %>%
+  mutate(
+    creatininetest_delta = creatininetest - creatininetest1,
+    creatininetest_percent = if_else(
+      !is.na(creatininetest1) & creatininetest1 > 0,
+      100 * creatininetest_delta / creatininetest1,
+      NA_real_
+    ),
+    eGFR_delta = egfr_calculated - eGFR1,
+    eGFR_percent = if_else(
+      !is.na(eGFR1) & eGFR1 > 0, 100 * eGFR_delta / eGFR1, NA_real_
+    )
+  ) %>%
+  filter(is.finite(eGFR_delta)) %>%
+  group_by(RKD.ID) %>%
+  mutate(
+    n_of_eGFR = n(),
+    has_post_diagnosis = any(Interval.from.diagnosis..months. >= 0, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  filter(n_of_eGFR > 1, has_post_diagnosis)
+
+ECT_cohort <- crtn
+Ect_data <- ECT_cohort %>%
+  mutate(
+    gender = factor(gender),
+    ancaSpec = factor(ancaSpec, levels = c("MPO", "PR3", "Other")),
+    inductionFinal = factor(inductionFinal, levels = c("Cyclo", "Rituximab", "Other")),
+    Diagnosis = factor(Diagnosis, levels = c("MPA", "GPA"))
+  )
+
+cat("Full cohort IDs:", n_distinct(Full_cohort$RKD.ID), "\n")
+cat("Patients without baseline eGFR:", sum(!baseline_eGFR_status$has_baseline_eGFR), "\n")
+cat("ECT cohort IDs/rows:", n_distinct(Ect_data$RKD.ID), "/", nrow(Ect_data), "\n")
+
+stopifnot(
+  n_distinct(Full_cohort$RKD.ID) == 742L,
+  n_distinct(Ect_data$RKD.ID) == 311L
+)
+```
+
+## 3. We do analysis to the Cohort 1.
+We mainly interest in the change of eGFR in the first 6 month, and thus fit the mixed effects models with different covariates.
+
+```{r ect-models}
+fit_lme <- function(formula, data = Ect_data, na.action = na.fail) {
+  model <- nlme::lme(
+    formula, random = ~ 1 | RKD.ID, data = data,
+    method = "REML", na.action = na.action
+  )
+  model
+}
+
+lm1 <- fit_lme(eGFR_delta ~ Interval.from.diagnosis..months.)
+lm2 <- fit_lme(eGFR_delta ~ lspline(Interval.from.diagnosis..months., knot = c(2, 4)))
+lm3 <- fit_lme(eGFR_delta ~ gender * lspline(Interval.from.diagnosis..months., knot = c(2, 4)))
+
+Ect_data_2 <- Ect_data %>% filter(ancaSpec != "Other") %>% droplevels()
+lm5 <- fit_lme(
+  eGFR_delta ~ ancaSpec * lspline(Interval.from.diagnosis..months., knot = c(2, 4)),
+  Ect_data_2
+)
+lm6 <- fit_lme(
+  eGFR_delta ~ Diagnosis * lspline(Interval.from.diagnosis..months., knot = c(2, 4)),
+  na.action = na.omit
+)
+lm7 <- fit_lme(
+  eGFR_delta ~ inductionFinal * lspline(Interval.from.diagnosis..months., knot = c(2, 4))
+)
+lm8 <- fit_lme(
+  eGFR_delta ~ ancaSpec + gender +
+    inductionFinal * lspline(Interval.from.diagnosis..months., knot = c(2, 4)),
+  na.action = na.omit
+)
+
+model_exports <- list(lm3 = lm3, lm5 = lm5, lm6 = lm6, lm7 = lm7, lm8 = lm8)
+invisible(Map(
+  function(model, model_name) {
+    model_table <- summary(model)$tTable %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column("term")
+    save_table(model_table, paste0(model_name, "_tTable_egfr.csv"))
+  },
+  model_exports,
+  names(model_exports)
+))
+
+print(summary(lm2)$tTable)
+```
+
+```{r ect-figures, fig.width=7.2, fig.height=8.5}
+time_var <- "Interval.from.diagnosis..months."
+
+overall_grid <- setNames(
+  data.frame(seq(0, 6, length.out = 121)),
+  time_var
+)
+eff_overall_df <- predict_fixed_lme(lm2, overall_grid)
+
+# Extract the three spline slopes and P values directly from lm2.
+lm2_table <- summary(lm2)$tTable
+slope_rows <- grep("^lspline", rownames(lm2_table))
+stopifnot(length(slope_rows) == 3L)
+overall_stats <- tibble(
+  x = c(1, 3, 5),
+  interval = c("0-2 months", "2-4 months", "4-6 months"),
+  slope = lm2_table[slope_rows, "Value"],
+  p = lm2_table[slope_rows, "p-value"],
+  label = paste0(
+    interval, "\nSlope = ", sprintf("%.2f", slope), "/month\n",
+    vapply(p, format_p, character(1), prefix = TRUE)
+  )
+)
+
+p_overall <- ggplot(eff_overall_df, aes(x = .data[[time_var]], y = fit)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.35, colour = "grey55") +
+  geom_vline(xintercept = c(2, 4), linetype = "dotted", linewidth = 0.35, colour = "grey70") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "grey80", alpha = 0.55) +
+  geom_line(linewidth = 1.35, colour = "#0072B2", lineend = "round") +
+  geom_label(
+    data = overall_stats,
+    aes(x = x, y = Inf, label = label),
+    inherit.aes = FALSE,
+    vjust = 1.15,
+    size = 2.8,
+    lineheight = 0.95,
+    label.padding = grid::unit(0.14, "lines"),
+    label.r = grid::unit(0.08, "lines"),
+    linewidth = 0.2,
+    fill = scales::alpha("white", 0.92)
+  ) +
+  scale_x_continuous(breaks = 0:6, limits = c(0, 6), expand = expansion(mult = c(0.01, 0.02))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(6), expand = expansion(mult = c(0.08, 0.32))) +
+  labs(x = "Months since diagnosis", y = "Change in eGFR from baseline (mL/min/1.73 m²)") +
+  theme_manuscript()
+
+induction_grid <- expand_grid(
+  time_value = seq(0, 6, length.out = 121),
+  inductionFinal = factor(
+    c("Cyclo", "Rituximab", "Other"),
+    levels = c("Cyclo", "Rituximab", "Other")
+  )
+) %>%
+  rename(!!time_var := time_value)
+
+eff_ind_df <- predict_fixed_lme(lm7, induction_grid) %>%
+  mutate(
+    induction_label = recode(
+      as.character(inductionFinal),
+      Cyclo = "Cyclophosphamide",
+      Rituximab = "Rituximab",
+      Other = "Other"
+    ),
+    induction_label = factor(
+      induction_label,
+      levels = c("Cyclophosphamide", "Rituximab", "Other")
+    )
+  )
+
+p_induction <- ggplot(
+  eff_ind_df,
+  aes(
+    x = .data[[time_var]], y = fit,
+    colour = induction_label, fill = induction_label, group = induction_label
+  )
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.35, colour = "grey55") +
+  geom_vline(xintercept = c(2, 4), linetype = "dotted", linewidth = 0.35, colour = "grey70") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.12, colour = NA, show.legend = FALSE) +
+  geom_line(linewidth = 1.25, lineend = "round") +
+  scale_colour_manual(values = induction_cols, name = NULL) +
+  scale_fill_manual(values = induction_cols, guide = "none") +
+  scale_x_continuous(breaks = 0:6, limits = c(0, 6), expand = expansion(mult = c(0.01, 0.02))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(6), expand = expansion(mult = c(0.08, 0.08))) +
+  labs(x = "Months since diagnosis", y = expression(Delta~eGFR~"(mL/min/1.73"~m^2*")")) +
+  theme_manuscript()
+
+Figure2_combined <- (p_overall / p_induction) +
+  plot_layout(heights = c(1, 1.05), guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(legend.position = "bottom", plot.tag = element_text(face = "bold", size = 14))
+
+print(Figure2_combined)
+save_plot(p_overall, "Figure_2_overall_eGFR_recovery.png", 6.8, 4.6)
+save_plot(p_induction, "Figure_induction_treatment_eGFR_lm7.png", 6.8, 4.8)
+save_plot(Figure2_combined, "Figure_2_combined.png", 7.2, 8.5)
+ggsave(
+  file.path(output_dir, "Figure_2_combined.pdf"),
+  Figure2_combined, width = 7.2, height = 8.5, bg = "white"
+)
+```
+Now follow the figure 1 flowchart, we move analysis to Cohort 2 trajectory clustering
+
+```{r retrace-kml}
+RETRACE_base <- crtn %>%
+  mutate(
+    dateOfCensored_days = as.numeric(lastRecordedContact - dateOfDiagnosis),
+    daysfrmESKD_days = as.numeric(dateOfESKD - dateOfDiagnosis)
+  ) %>%
+  filter(!is.na(dateOfCensored_days), dateOfCensored_days > 180)
+
+ESKD_EARLY <- RETRACE_base %>%
+  filter(!is.na(daysfrmESKD_days), daysfrmESKD_days <= 180) %>%
+  distinct(RKD.ID) %>%
+  pull(RKD.ID)
+
+kmlDataMean_select <- RETRACE_base %>%
+  filter(!RKD.ID %in% ESKD_EARLY) %>%
+  mutate(
+    time = pmax(Interval.from.diagnosis..months., 0),
+    time_bin = pmin(pmax(ceiling(time), 1), 6)
+  ) %>%
+  group_by(RKD.ID, time_bin) %>%
+  summarise(mean = mean(eGFR_delta, na.rm = TRUE), .groups = "drop") %>%
+  filter(is.finite(mean)) %>%
+  group_by(RKD.ID) %>%
+  filter(n_distinct(time_bin) > 1) %>%
+  ungroup()
+
+if (n_distinct(kmlDataMean_select$RKD.ID) < 2) {
+  stop("KML cohort has fewer than two patients after filtering.")
+}
+
+month_cols <- paste0("month_", 1:6)
+kml_wide <- kmlDataMean_select %>%
+  mutate(time_bin = factor(time_bin, levels = 1:6, labels = month_cols)) %>%
+  pivot_wider(id_cols = RKD.ID, names_from = time_bin, values_from = mean) %>%
+  arrange(RKD.ID) %>%
+  as.data.frame()
+
+for (column in setdiff(month_cols, names(kml_wide))) kml_wide[[column]] <- NA_real_
+kml_wide <- kml_wide[, c("RKD.ID", month_cols)]
+id_order <- kml_wide$RKD.ID
+
+kml_obj <- kml::cld(kml_wide, timeInData = 2:ncol(kml_wide))
+set.seed(123)
+kml::kml(kml_obj, nbClusters = 2:5, nbRedrawing = 20)
+cl2 <- getClusters(kml_obj, 2)
+
+cluster_df_raw <- tibble(RKD.ID = id_order, cluster_raw = as.integer(cl2))
+latest_by_id <- kmlDataMean_select %>%
+  group_by(RKD.ID) %>%
+  slice_max(time_bin, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(cluster_df_raw, by = "RKD.ID")
+
+# Name clusters by the mean change at each patient's final available month.
+cluster_order <- latest_by_id %>%
+  group_by(cluster_raw) %>%
+  summarise(latest_mean_eGFR_delta = mean(mean, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(latest_mean_eGFR_delta)) %>%
+  mutate(
+    cluster = row_number(),
+    cluster_name = c("Recovered group", "Static group")[cluster]
+  )
+
+cluster_df <- cluster_df_raw %>%
+  left_join(cluster_order, by = "cluster_raw") %>%
+  select(RKD.ID, cluster, cluster_raw, cluster_name)
+
+cluster_count <- cluster_df %>%
+  count(cluster, cluster_name, name = "n") %>%
+  arrange(cluster) %>%
+  mutate(
+    prop = round(100 * n / sum(n), 1),
+    cluster_label = cluster_name
+  )
+
+cluster_df <- cluster_df %>%
+  left_join(
+    cluster_count %>% select(cluster, cluster_name, n, prop, cluster_label),
+    by = c("cluster", "cluster_name")
+  )
+
+Data_wide <- kmlDataMean_select %>%
+  left_join(cluster_df, by = "RKD.ID") %>%
+  mutate(cluster_label = factor(
+    cluster_label,
+    levels = c("Recovered group", "Static group")
+  ))
+
+cluster_means <- Data_wide %>%
+  group_by(cluster, cluster_label, time_bin) %>%
+  summarise(mean_value = mean(mean, na.rm = TRUE), .groups = "drop")
+
+print(cluster_count)
+stopifnot(
+  n_distinct(RETRACE_base$RKD.ID) == 285L,
+  length(ESKD_EARLY) == 34L,
+  n_distinct(kmlDataMean_select$RKD.ID) == 234L,
+  setequal(cluster_count$n, c(97L, 137L))
+)
+```
+
+```{r cluster-selection-figure, fig.width=7.4, fig.height=4.6}
+crit_mat <- tryCatch(
+  as(kml_obj, "ListPartition")["criterionValuesAsMatrix"],
+  error = function(e) kml_obj["criterionValuesAsMatrix"]
+) %>%
+  as.matrix()
+
+if (nrow(crit_mat) == 20 && ncol(crit_mat) == 4) crit_mat <- t(crit_mat)
+if (is.null(rownames(crit_mat)) ||
+    any(is.na(suppressWarnings(as.numeric(rownames(crit_mat)))))) {
+  rownames(crit_mat) <- 2:(nrow(crit_mat) + 1)
+}
+
+crit_long <- as.data.frame(crit_mat, check.names = FALSE) %>%
+  mutate(k = as.integer(gsub("[^0-9]", "", rownames(crit_mat)))) %>%
+  filter(k %in% 2:5) %>%
+  pivot_longer(-k, names_to = "redrawing", values_to = "CH") %>%
+  mutate(CH = num_clean(CH)) %>%
+  filter(is.finite(CH)) %>%
+  group_by(k) %>%
+  arrange(desc(CH), .by_group = TRUE) %>%
+  mutate(
+    redrawing_rank = row_number(),
+    solution = factor(paste0(k, "-group solution"), levels = paste0(2:5, "-group solution")),
+    selected = factor(k == 2, levels = c(FALSE, TRUE))
+  ) %>%
+  ungroup()
+
+ch_cols <- c(
+  "2-group solution" = "#0072B2", "3-group solution" = "#D55E00",
+  "4-group solution" = "#009E73", "5-group solution" = "grey55"
+)
+
+p_ch <- ggplot(
+  crit_long,
+  aes(redrawing_rank, CH, colour = solution, group = solution)
+) +
+  geom_line(aes(linewidth = selected, alpha = selected), lineend = "round") +
+  geom_point(aes(size = selected, alpha = selected)) +
+  scale_colour_manual(values = ch_cols, name = NULL) +
+  scale_linewidth_manual(values = c("FALSE" = 0.7, "TRUE" = 1.35), guide = "none") +
+  scale_size_manual(values = c("FALSE" = 1.8, "TRUE" = 2.5), guide = "none") +
+  scale_alpha_manual(values = c("FALSE" = 0.65, "TRUE" = 1), guide = "none") +
+  scale_x_continuous(breaks = c(1, 5, 10, 15, 20)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(6)) +
+  labs(
+    x = "Rank across repeated random initializations",
+    y = "Calinski-Harabasz criterion"
+  ) +
+  theme_manuscript()
+
+print(p_ch)
+save_plot(p_ch, "Figure_4_cluster_selection_CH-2.png", 7.4, 4.6)
+```
+
+```{r trajectory-figure, fig.width=7.2, fig.height=5.2}
+group_info <- Data_wide %>%
+  distinct(RKD.ID, cluster_label) %>%
+  count(cluster_label, name = "n") %>%
+  mutate(
+    pct = round(100 * n / sum(n), 1),
+    legend_lab = paste0(cluster_label, " (n = ", n, ", ", pct, "%)")
+  )
+legend_labs <- setNames(group_info$legend_lab, group_info$cluster_label)
+
+plot_c <- ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, colour = "grey55") +
+  geom_line(
+    data = Data_wide,
+    aes(time_bin, mean, group = RKD.ID, colour = cluster_label),
+    alpha = 0.15, linewidth = 0.35, show.legend = FALSE
+  ) +
+  geom_line(
+    data = cluster_means,
+    aes(time_bin, mean_value, colour = cluster_label, group = cluster_label),
+    linewidth = 1.4
+  ) +
+  geom_point(
+    data = cluster_means,
+    aes(time_bin, mean_value, colour = cluster_label),
+    size = 2.4
+  ) +
+  scale_colour_manual(values = group_cols, labels = legend_labs, drop = FALSE) +
+  scale_x_continuous(
+    breaks = 1:6,
+    labels = c("0-1", ">1-2", ">2-3", ">3-4", ">4-5", ">5-6")
+  ) +
+  scale_y_continuous(
+    breaks = seq(-100, 100, by = 10),
+    labels = function(x) ifelse(x > 0, paste0("+", x), x)
+  ) +
+  coord_cartesian(ylim = c(-100, 100)) +
+  labs(
+    title = "Early eGFR recovery groups",
+    x = "Months since diagnosis",
+    y = "Change in eGFR from baseline (mL/min/1.73 m²)",
+    colour = NULL
+  ) +
+  theme_manuscript() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 15))
+
+print(plot_c)
+save_plot(plot_c, "Figure_1_egfr_recovery_groups.png", 7.2, 5.2)
+```
+Now we move to check whether the 5yrs-ESKD risk will differ statistically between two groups
+## 5. RETRACE outcome analysis
+
+```{r fine-gray-models}
+RETRACE_cohort <- RETRACE_base %>% filter(RKD.ID %in% cluster_df$RKD.ID)
+
+RESULT_crr <- RETRACE_cohort %>%
+  arrange(RKD.ID, Interval.from.diagnosis..months.) %>%
+  distinct(RKD.ID, .keep_all = TRUE) %>%
+  left_join(cluster_df, by = "RKD.ID") %>%
+  mutate(
+    daysfrmDeath = as.numeric(dateOfDeath - dateOfDiagnosis) / 365.25,
+    dateOfCensored = dateOfCensored_days / 365.25,
+    daysfrmESKD = daysfrmESKD_days / 365.25,
+    time_to_eskd = if_else(!is.na(daysfrmESKD), daysfrmESKD, Inf),
+    time_to_death = if_else(!is.na(daysfrmDeath), daysfrmDeath, Inf),
+    time_to_censor = if_else(!is.na(dateOfCensored), dateOfCensored, Inf),
+    time = pmin(time_to_eskd, time_to_death, time_to_censor, na.rm = TRUE),
+    status = case_when(
+      ESKDStandard == "Yes" &
+        time_to_eskd <= time_to_death & time_to_eskd <= time_to_censor ~ 1L,
+      death == "Dead" &
+        time_to_death < time_to_eskd & time_to_death <= time_to_censor ~ 2L,
+      TRUE ~ 0L
+    ),
+    status = if_else(time > 5, 0L, status),
+    time = pmin(time, 5),
+    cluster_label = factor(
+      cluster_label,
+      levels = c("Recovered group", "Static group")
+    ),
+    eGFR1_10 = eGFR1 / 10,
+    creatininetest1_10 = creatininetest1 / 10
+  )
+
+X <- model.matrix(~ factor(cluster), RESULT_crr)[, -1, drop = FALSE]
+fit_crr <- cmprsk::crr(
+  ftime = RESULT_crr$time, fstatus = RESULT_crr$status,
+  cov1 = X, failcode = 1, cencode = 0, maxiter = 100
+)
+
+fg_data <- RESULT_crr %>%
+  select(
+    time, status, cluster, gender, ageAtDiagnosis, ancaSpec,
+    inductionFinal, eGFR1_10, Berden.score.on.renal.biopsy
+  ) %>%
+  mutate(
+    gender = factor(gender),
+    ancaSpec = factor(ancaSpec, levels = c("MPO", "PR3", "Other")),
+    inductionFinal = factor(inductionFinal, levels = c("Cyclo", "Rituximab", "Other")),
+    Berden.score.on.renal.biopsy = factor(Berden.score.on.renal.biopsy)
+  ) %>%
+  filter(complete.cases(.)) %>%
+  droplevels()
+
+X_full <- model.matrix(
+  ~ factor(cluster) + gender + ageAtDiagnosis + ancaSpec +
+    inductionFinal + eGFR1_10 + Berden.score.on.renal.biopsy,
+  fg_data
+)[, -1, drop = FALSE]
+
+fit_crr_full <- cmprsk::crr(
+  ftime = fg_data$time, fstatus = fg_data$status,
+  cov1 = X_full, failcode = 1, cencode = 0, maxiter = 100
+)
+
+capture.output(
+  summary(fit_crr_full),
+  file = file.path(output_dir, "fit_crr_full_summary.txt")
+)
+
+outcome_check <- with(
+  RESULT_crr,
+  table(cluster_label, factor(status, levels = 0:2))
+)
+print(outcome_check)
+print(summary(fit_crr))
+print(summary(fit_crr_full))
+
+stopifnot(
+  nrow(RESULT_crr) == 234L,
+  !anyDuplicated(RESULT_crr$RKD.ID),
+  all(outcome_check == matrix(c(89L, 114L, 1L, 15L, 7L, 8L), nrow = 2L))
+)
+```
+
+```{r retrace-cif, fig.width=7.2, fig.height=5.35}
+if (!any(RESULT_crr$status == 1L)) stop("No ESKD events available for the CIF.")
+
+cif_fit <- cmprsk::cuminc(
+  ftime = RESULT_crr$time,
+  fstatus = RESULT_crr$status,
+  group = RESULT_crr$cluster_label,
+  cencode = 0
+)
+
+cif_df_eskd <- tidy_cuminc(cif_fit, event_code = 1L) %>%
+  mutate(group = factor(group, levels = c("Recovered group", "Static group")))
+
+fg_univariable_result <- fine_gray_stats(fit_crr)
+fg_annotation <- with(
+  fg_univariable_result,
+  paste0(
+    "Univariable Fine–Gray model\n",
+    "Static group vs Recovered group: SHR ", sprintf("%.2f", SHR),
+    " (95% CI ", sprintf("%.2f", lower), "–", sprintf("%.2f", upper), "); ",
+    format_p(p, prefix = TRUE)
+  )
+)
+
+p_cif <- ggplot(
+  cif_df_eskd,
+  aes(time, estimate, colour = group, fill = group)
+) +
+  geom_step(linewidth = 1) +
+  geom_ribbon(
+    aes(ymin = lower, ymax = upper),
+    alpha = 0.14, colour = NA, show.legend = FALSE
+  ) +
+  annotate(
+    "text", x = 0.20, y = 0.385, label = fg_annotation,
+    hjust = 0, vjust = 1, size = 3.8, lineheight = 1.05
+  ) +
+  coord_cartesian(xlim = c(0, 5), ylim = c(0, 0.4), expand = FALSE) +
+  scale_x_continuous(breaks = 0:5) +
+  scale_y_continuous(
+    breaks = seq(0, 0.4, by = 0.1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_colour_manual(values = group_cols, drop = FALSE) +
+  scale_fill_manual(values = group_cols, drop = FALSE) +
+  labs(
+    title = "Cumulative incidence of ESKD",
+    x = "Time in years since diagnosis",
+    y = "Cumulative incidence",
+    colour = NULL,
+    fill = NULL
+  ) +
+  theme_manuscript() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 15))
+
+print(p_cif)
+save_plot(p_cif, "Figure_2_ESKD_CIF.png", 7.2, 5.35)
+```
+
+After we checked the difference of CIF in two different clustering group, we now define Cohort 3 and check the eGFR slope difference between two clusters.
+T1 is the earliest occurrence of the highest available eGFR between 4 and 12 months after diagnosis.Measurements from T1 through 60 months after diagnosis are retained, including measurements after ESKD; follow-up ends at transplantation, death, or last recorded contact. Eligibility requires T1 and at least one later eGFR measurement on a distinct date.
+
+
+```{r post-peak-slope-data}
+slope_output_dir <- file.path(output_dir, "post_peak_egfr_slope")
+dir.create(slope_output_dir, recursive = TRUE, showWarnings = FALSE)
+
+slope_ids <- cluster_df %>%
+  transmute(RKD.ID, cluster_label = as.character(cluster_label)) %>%
+  distinct()
+
+patient_endpoints <- renal_raw %>%
+  semi_join(slope_ids, by = "RKD.ID") %>%
+  group_by(RKD.ID) %>%
+  summarise(
+    dateOfESKD = first_valid_date(dateOfESKD),
+    dateOfDeath = first_valid_date(dateOfDeath),
+    lastRecordedContact = first_valid_date(lastRecordedContact),
+    .groups = "drop"
+  )
+
+transplant_dates <- if ("Date.of.transplant." %in% names(raw_data)) {
+  raw_data %>%
+    semi_join(slope_ids, by = "RKD.ID") %>%
+    transmute(RKD.ID, dateOfTransplant = date_clean(Date.of.transplant.)) %>%
+    group_by(RKD.ID) %>%
+    summarise(
+      dateOfTransplant = first_valid_date(sort(dateOfTransplant)),
+      .groups = "drop"
+    )
+} else {
+  slope_ids %>% transmute(RKD.ID, dateOfTransplant = as.Date(NA_character_))
+}
+
+slope_source <- renal_raw %>%
+  select(
+    RKD.ID, Date.Of.Visit, Interval.from.diagnosis..months.,
+    egfr_calculated, Dialysis.dependent
+  ) %>%
+  inner_join(slope_ids, by = "RKD.ID") %>%
+  left_join(patient_endpoints, by = "RKD.ID") %>%
+  left_join(transplant_dates, by = "RKD.ID") %>%
+  mutate(
+    interval_months = num_clean(Interval.from.diagnosis..months.),
+    dialysis_dependent = Dialysis.dependent == "Yes",
+    eGFR = if_else(dialysis_dependent, 3, num_clean(egfr_calculated))
+  ) %>%
+  filter(
+    !is.na(Date.Of.Visit), is.finite(interval_months), is.finite(eGFR),
+    between(interval_months, 4, 60),
+    is.na(dateOfTransplant) | Date.Of.Visit < dateOfTransplant,
+    is.na(dateOfDeath) | Date.Of.Visit <= dateOfDeath,
+    is.na(lastRecordedContact) | Date.Of.Visit <= lastRecordedContact
+  )
+
+# Collapse same-day records; any dialysis-dependent row fixes that date at 3.
+same_day_audit <- slope_source %>%
+  count(RKD.ID, Date.Of.Visit, name = "n_rows") %>%
+  filter(n_rows > 1)
+
+slope_visits <- slope_source %>%
+  group_by(RKD.ID, Date.Of.Visit) %>%
+  summarise(
+    cluster_label = first(cluster_label),
+    dateOfESKD = first_valid_date(dateOfESKD),
+    interval_months = mean(interval_months),
+    dialysis_dependent = any(dialysis_dependent),
+    eGFR = if_else(dialysis_dependent, 3, mean(eGFR)),
+    .groups = "drop"
+  )
+
+t1_candidates <- slope_visits %>% filter(between(interval_months, 4, 12))
+t1_tie_audit <- t1_candidates %>%
+  group_by(RKD.ID) %>%
+  filter(eGFR == max(eGFR)) %>%
+  summarise(n_tied_dates = n_distinct(Date.Of.Visit), .groups = "drop") %>%
+  filter(n_tied_dates > 1)
+
+t1_by_patient <- t1_candidates %>%
+  arrange(RKD.ID, desc(eGFR), Date.Of.Visit) %>%
+  group_by(RKD.ID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(
+    RKD.ID, T1_date = Date.Of.Visit,
+    T1_month = interval_months, T1_eGFR = eGFR
+  )
+
+t1_source_audit <- renal_raw %>%
+  semi_join(slope_ids, by = "RKD.ID") %>%
+  transmute(
+    RKD.ID, Date.Of.Visit,
+    interval_months = num_clean(Interval.from.diagnosis..months.),
+    eGFR = if_else(Dialysis.dependent == "Yes", 3, num_clean(egfr_calculated))
+  ) %>%
+  group_by(RKD.ID) %>%
+  summarise(
+    any_record_4_12 = any(
+      !is.na(interval_months) & between(interval_months, 4, 12)
+    ),
+    any_usable_eGFR_4_12 = any(
+      !is.na(Date.Of.Visit) & !is.na(interval_months) &
+        between(interval_months, 4, 12) & is.finite(eGFR)
+    ),
+    .groups = "drop"
+  )
+
+t1_disposition <- slope_ids %>%
+  left_join(t1_source_audit, by = "RKD.ID") %>%
+  mutate(
+    across(c(any_record_4_12, any_usable_eGFR_4_12), ~ coalesce(.x, FALSE)),
+    T1_status = case_when(
+      RKD.ID %in% t1_by_patient$RKD.ID ~ "T1 available",
+      !any_record_4_12 ~ "No record at 4-12 months",
+      !any_usable_eGFR_4_12 ~ "Record present, but no usable eGFR",
+      TRUE ~ "Excluded by endpoint/date rule"
+    )
+  ) %>%
+  count(T1_status, name = "n")
+
+slope_after_t1 <- slope_visits %>%
+  inner_join(t1_by_patient, by = "RKD.ID") %>%
+  filter(Date.Of.Visit >= T1_date, interval_months <= 60) %>%
+  mutate(time_from_T1_years = as.numeric(Date.Of.Visit - T1_date) / 365.25)
+
+slope_patient_eligibility <- slope_ids %>%
+  left_join(t1_by_patient, by = "RKD.ID") %>%
+  left_join(
+    slope_after_t1 %>%
+      group_by(RKD.ID) %>%
+      summarise(
+        n_slope_visits = n_distinct(Date.Of.Visit),
+        has_post_T1_visit = any(time_from_T1_years > 0),
+        maximum_followup_from_T1_years = max(time_from_T1_years),
+        .groups = "drop"
+      ),
+    by = "RKD.ID"
+  ) %>%
+  mutate(
+    has_T1 = !is.na(T1_date),
+    n_slope_visits = coalesce(n_slope_visits, 0L),
+    has_post_T1_visit = coalesce(has_post_T1_visit, FALSE),
+    model_eligible = has_T1 & n_slope_visits >= 2 & has_post_T1_visit
+  )
+
+slope_flow <- bind_rows(
+  slope_patient_eligibility %>%
+    group_by(cluster_label) %>%
+    summarise(
+      RETRACE_N = n(), T1_available = sum(has_T1),
+      model_N = sum(model_eligible), .groups = "drop"
+    ),
+  slope_patient_eligibility %>%
+    summarise(
+      cluster_label = "Overall", RETRACE_N = n(),
+      T1_available = sum(has_T1), model_N = sum(model_eligible)
+    )
+)
+
+slope_data <- slope_after_t1 %>%
+  semi_join(
+    slope_patient_eligibility %>% filter(model_eligible),
+    by = "RKD.ID"
+  ) %>%
+  mutate(
+    cluster_slope = factor(
+      cluster_label, levels = c("Static group", "Recovered group")
+    )
+  ) %>%
+  arrange(RKD.ID, time_from_T1_years)
+
+dialysis3_audit <- bind_rows(
+  slope_source %>% summarise(
+    analysis_stage = "All eligible 4-60 month source rows",
+    dialysis_rows = sum(dialysis_dependent),
+    dialysis_patients = n_distinct(RKD.ID[dialysis_dependent])
+  ),
+  slope_data %>% summarise(
+    analysis_stage = "Primary model data from T1 onward",
+    dialysis_rows = sum(dialysis_dependent),
+    dialysis_patients = n_distinct(RKD.ID[dialysis_dependent])
+  )
+)
+
+stopifnot(
+  nrow(slope_ids) == 234L,
+  slope_flow$T1_available[slope_flow$cluster_label == "Overall"] == 166L,
+  slope_flow$model_N[slope_flow$cluster_label == "Overall"] == 148L,
+  sum(slope_patient_eligibility$model_eligible &
+        slope_patient_eligibility$cluster_label == "Recovered group") == 58L,
+  sum(slope_patient_eligibility$model_eligible &
+        slope_patient_eligibility$cluster_label == "Static group") == 90L,
+  nrow(slope_data) == 875L
+)
+
+print(slope_flow)
+print(t1_disposition)
+print(dialysis3_audit)
+```
+
+```{r post-peak-slope-model-and-figures, fig.width=10.2, fig.height=9.8}
+slope_control <- nlme::lmeControl(
+  opt = "optim", maxIter = 200, msMaxIter = 200,
+  niterEM = 50, returnObject = TRUE
+)
+slope_model <- nlme::lme(
+  eGFR ~ time_from_T1_years * cluster_slope,
+  random = ~ time_from_T1_years | RKD.ID,
+  data = slope_data, method = "REML", na.action = na.exclude,
+  control = slope_control
+)
+
+# Sensitivity checks for the random-slope and linear-time specifications.
+slope_random_intercept_model <- nlme::lme(
+  eGFR ~ time_from_T1_years * cluster_slope,
+  random = ~ 1 | RKD.ID,
+  data = slope_data, method = "REML", na.action = na.exclude,
+  control = slope_control
+)
+slope_random_effect_comparison <- anova(
+  slope_random_intercept_model, slope_model
+)
+slope_linear_ml_model <- update(slope_model, method = "ML")
+slope_quadratic_ml_model <- nlme::lme(
+  eGFR ~ (time_from_T1_years + I(time_from_T1_years^2)) * cluster_slope,
+  random = ~ time_from_T1_years | RKD.ID,
+  data = slope_data, method = "ML", na.action = na.exclude,
+  control = slope_control
+)
+slope_linearity_comparison <- anova(
+  slope_linear_ml_model, slope_quadratic_ml_model
+)
+
+slope_beta <- nlme::fixef(slope_model)
+slope_vcov <- vcov(slope_model)
+slope_time_term <- "time_from_T1_years"
+slope_interaction_term <- grep(
+  "time_from_T1_years:cluster_slope|cluster_slope.*:time_from_T1_years",
+  names(slope_beta), value = TRUE
+)
+stopifnot(length(slope_interaction_term) == 1L)
+slope_df <- min(summary(slope_model)$tTable[
+  c(slope_time_term, slope_interaction_term), "DF"
+])
+
+slope_contrast <- function(weights, label) {
+  L <- setNames(rep(0, length(slope_beta)), names(slope_beta))
+  L[names(weights)] <- weights
+  estimate <- sum(L * slope_beta)
+  SE <- sqrt(as.numeric(t(L) %*% slope_vcov %*% L))
+  critical <- qt(0.975, slope_df)
+  tibble(
+    estimand = label, estimate, SE, df = slope_df,
+    lower_95_CI = estimate - critical * SE,
+    upper_95_CI = estimate + critical * SE,
+    p_value = 2 * pt(abs(estimate / SE), slope_df, lower.tail = FALSE)
+  )
+}
+
+slope_results <- bind_rows(
+  slope_contrast(
+    setNames(1, slope_time_term),
+    "Static group annual post-peak eGFR slope"
+  ),
+  slope_contrast(
+    setNames(c(1, 1), c(slope_time_term, slope_interaction_term)),
+    "Recovered group annual post-peak eGFR slope"
+  ),
+  slope_contrast(
+    setNames(1, slope_interaction_term),
+    "Recovered minus Static slope difference"
+  )
+) %>%
+  mutate(
+    unit = "mL/min/1.73 m^2/year",
+    estimate_95_CI = sprintf(
+      "%.2f (%.2f to %.2f)", estimate, lower_95_CI, upper_95_CI
+    ),
+    p_value_formatted = vapply(p_value, format_p, character(1))
+  )
+
+fixed_effect_table <- as.data.frame(summary(slope_model)$tTable) %>%
+  tibble::rownames_to_column("term")
+
+prediction_grid <- expand_grid(
+  time_from_T1_years = seq(0, max(slope_data$time_from_T1_years), length.out = 120),
+  cluster_slope = factor(
+    c("Static group", "Recovered group"),
+    levels = c("Static group", "Recovered group")
+  )
+)
+slope_design <- model.matrix(
+  ~ time_from_T1_years * cluster_slope, prediction_grid
+)
+prediction_grid <- prediction_grid %>%
+  mutate(
+    estimate = as.numeric(slope_design %*% slope_beta),
+    SE = sqrt(rowSums((slope_design %*% slope_vcov) * slope_design)),
+    lower = estimate - 1.96 * SE,
+    upper = estimate + 1.96 * SE
+  )
+
+slope_legend <- slope_data %>%
+  distinct(RKD.ID, cluster_slope) %>%
+  count(cluster_slope, name = "n") %>%
+  transmute(
+    cluster_slope,
+    label = paste0(cluster_slope, " (n = ", n, ")")
+  ) %>%
+  { setNames(.$label, .$cluster_slope) }
+
+p_slope_trajectory <- ggplot(
+  slope_data,
+  aes(time_from_T1_years, eGFR, group = RKD.ID, colour = cluster_slope)
+) +
+  geom_line(alpha = 0.075, linewidth = 0.28) +
+  geom_point(alpha = 0.12, size = 0.62) +
+  geom_ribbon(
+    data = prediction_grid,
+    aes(
+      x = time_from_T1_years, ymin = lower, ymax = upper,
+      fill = cluster_slope, group = cluster_slope
+    ),
+    inherit.aes = FALSE, alpha = 0.16, colour = NA
+  ) +
+  geom_line(
+    data = prediction_grid,
+    aes(
+      time_from_T1_years, estimate,
+      colour = cluster_slope, group = cluster_slope
+    ),
+    inherit.aes = FALSE, linewidth = 1.18
+  ) +
+  scale_colour_manual(
+    values = group_cols,
+    breaks = c("Recovered group", "Static group"),
+    labels = slope_legend[c("Recovered group", "Static group")]
+  ) +
+  scale_fill_manual(values = group_cols) +
+  scale_x_continuous(
+    breaks = 0:5, limits = c(0, max(slope_data$time_from_T1_years)),
+    expand = expansion(mult = c(0.01, 0.025))
+  ) +
+  scale_y_continuous(breaks = c(0, 20, 40, 60, 80, 90)) +
+  coord_cartesian(ylim = c(0, 90), expand = FALSE) +
+  labs(
+    title = "Post-peak eGFR trajectories by recovery group",
+    x = "Years since T1",
+    y = expression(eGFR~"(mL/min/1.73"~m^2*")"),
+    colour = NULL, fill = NULL
+  ) +
+  theme_classic(base_size = 11.5) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13.5),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(colour = "black"),
+    legend.position = "bottom",
+    legend.justification = "left",
+    legend.key.width = grid::unit(1.6, "lines")
+  ) +
+  guides(
+    fill = "none",
+    colour = guide_legend(override.aes = list(alpha = 1, linewidth = 1.5))
+  )
+
+forest_data <- slope_results %>%
+  mutate(
+    row = c(3, 2, 1),
+    label = c(
+      "Static group slope", "Recovered group slope",
+      "Recovered - Static difference"
+    ),
+    series = c("Static group", "Recovered group", "Difference"),
+    result_label = c(
+      sprintf(
+        "%.2f (%.2f to %.2f); P = %.3f",
+        estimate[1], lower_95_CI[1], upper_95_CI[1], p_value[1]
+      ),
+      sprintf(
+        "%.2f (%.2f to %.2f); P = %.3f",
+        estimate[2], lower_95_CI[2], upper_95_CI[2], p_value[2]
+      ),
+      sprintf(
+        "%.2f (%.2f to %.2f); interaction P = %.3f",
+        estimate[3], lower_95_CI[3], upper_95_CI[3], p_value[3]
+      )
+    )
+  )
+
+p_slope_forest <- ggplot(forest_data, aes(y = row)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey45") +
+  geom_segment(
+    aes(
+      x = lower_95_CI, xend = upper_95_CI,
+      yend = row, colour = series
+    ),
+    linewidth = 1.05, lineend = "round"
+  ) +
+  geom_point(aes(x = estimate, colour = series, shape = series), size = 3.4) +
+  geom_text(
+    aes(x = 5.35, label = result_label),
+    hjust = 0, size = 3.35, colour = "black"
+  ) +
+  annotate(
+    "text", x = 5.35, y = 3.72,
+    label = "Estimate (95% CI); P value",
+    hjust = 0, fontface = "bold", size = 3.45
+  ) +
+  scale_colour_manual(
+    values = c(group_cols, "Difference" = "#222222"), guide = "none"
+  ) +
+  scale_shape_manual(
+    values = c("Static group" = 16, "Recovered group" = 16, "Difference" = 18),
+    guide = "none"
+  ) +
+  scale_y_continuous(
+    breaks = forest_data$row, labels = forest_data$label,
+    limits = c(0.55, 3.85), expand = expansion(mult = c(0, 0))
+  ) +
+  scale_x_continuous(breaks = seq(-4, 4, 2), expand = expansion(mult = c(0, 0))) +
+  coord_cartesian(xlim = c(-4.3, 5.15), clip = "off") +
+  labs(
+    title = "Annual post-peak eGFR slopes",
+    x = expression(
+      "Annual eGFR change or difference (mL/min/1.73"~m^2*"/year)"
+    ),
+    y = NULL
+  ) +
+  theme_classic(base_size = 11.5) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13.5),
+    axis.title.x = element_text(face = "bold"),
+    axis.text = element_text(colour = "black"),
+    axis.line.y = element_blank(), axis.ticks.y = element_blank(),
+    plot.margin = margin(8, 245, 10, 12)
+  )
+
+p_slope_combined <- (
+  p_slope_trajectory / p_slope_forest +
+    patchwork::plot_layout(heights = c(1.18, 1)) +
+    patchwork::plot_annotation(tag_levels = "A")
+) & theme(plot.tag = element_text(face = "bold", size = 15))
+
+print(slope_results %>% select(estimand, estimate_95_CI, p_value_formatted))
+print(slope_random_effect_comparison)
+print(slope_linearity_comparison)
+print(nlme::VarCorr(slope_model))
+print(p_slope_combined)
+
+save_table(slope_flow, "post_peak_egfr_slope/RETRACE_post_peak_slope_cohort_flow.csv")
+save_table(t1_disposition, "post_peak_egfr_slope/RETRACE_post_peak_T1_disposition.csv")
+save_table(t1_by_patient, "post_peak_egfr_slope/RETRACE_post_peak_T1_by_patient.csv")
+save_table(dialysis3_audit, "post_peak_egfr_slope/RETRACE_post_peak_dialysis3_audit.csv")
+save_table(
+  slope_patient_eligibility,
+  "post_peak_egfr_slope/RETRACE_post_peak_slope_patient_eligibility.csv"
+)
+save_table(same_day_audit, "post_peak_egfr_slope/RETRACE_post_peak_same_day_audit.csv")
+save_table(t1_tie_audit, "post_peak_egfr_slope/RETRACE_post_peak_T1_tie_audit.csv")
+save_table(slope_results, "post_peak_egfr_slope/RETRACE_post_peak_slope_results.csv")
+save_table(
+  fixed_effect_table,
+  "post_peak_egfr_slope/RETRACE_post_peak_slope_fixed_effects.csv"
+)
+save_table(
+  prediction_grid,
+  "post_peak_egfr_slope/RETRACE_post_peak_slope_fitted_curves.csv"
+)
+save_table(
+  as.data.frame(slope_random_effect_comparison),
+  "post_peak_egfr_slope/RETRACE_post_peak_random_effect_comparison.csv"
+)
+save_table(
+  as.data.frame(slope_linearity_comparison),
+  "post_peak_egfr_slope/RETRACE_post_peak_linearity_comparison.csv"
+)
+saveRDS(slope_model, file.path(slope_output_dir, "RETRACE_post_peak_slope_model.rds"))
+save_plot(
+  p_slope_trajectory,
+  "post_peak_egfr_slope/Figure_post_peak_eGFR_trajectories.png", 10.2, 5.35
+)
+save_plot(
+  p_slope_forest,
+  "post_peak_egfr_slope/Figure_post_peak_eGFR_slope_forest.png", 10.2, 4.5
+)
+save_plot(
+  p_slope_combined,
+  "post_peak_egfr_slope/Figure_post_peak_eGFR_combined.png", 10.2, 9.8
+)
+save_plot(
+  p_slope_combined,
+  "post_peak_egfr_slope/Figure_post_peak_eGFR_combined.pdf", 10.2, 9.8
+)
+```
+
+### Cohort 3 characteristics
+
+```{r cohort3-characteristics-table}
+cohort3_ids <- slope_patient_eligibility %>%
+  filter(model_eligible) %>%
+  select(
+    RKD.ID, cluster_label, T1_date, T1_month, T1_eGFR,
+    n_slope_visits, maximum_followup_from_T1_years
+  )
+
+# Reuse the Cohort 2 baseline rule and its dialysis substitutions.
+cohort3_baseline <- bind_rows(baseline_post, baseline_pre) %>%
+  distinct(RKD.ID, .keep_all = TRUE) %>%
+  transmute(
+    RKD.ID,
+    baseline_visit_date = Date.Of.Visit,
+    baseline_month = Interval.from.diagnosis..months.,
+    baseline_creatinine = creatininetest,
+    baseline_eGFR = egfr_calculated,
+    baseline_dialysis_dependent = Dialysis.dependent == "Yes"
+  )
+
+any_flagged <- function(x, yes = "Checked") {
+  x <- trimws(as.character(x))
+  if (any(x %in% yes, na.rm = TRUE)) TRUE else
+    if (all(is.na(x) | x == "")) NA else FALSE
+}
+
+cohort3_features <- raw_data %>%
+  semi_join(cohort3_ids, by = "RKD.ID") %>%
+  group_by(RKD.ID) %>%
+  summarise(
+    age_at_diagnosis = first_finite(ageAtDiagnosis),
+    sex = first_nonblank(gender),
+    anca_specificity = {
+      x <- first_nonblank(ancaSpec)
+      if (is.na(x)) NA_character_ else if (x %in% c("MPO", "PR3")) x else "Other"
+    },
+    diagnosis = case_when(
+      any(num_clean(DefiniteMPA) == 1, na.rm = TRUE) ~ "MPA",
+      any(num_clean(DefiniteGPA) == 1, na.rm = TRUE) ~ "GPA",
+      TRUE ~ NA_character_
+    ),
+    berden_class = {
+      x <- trimws(as.character(Berden.score.on.renal.biopsy))
+      x <- x[x %in% c("Crescentic", "Focal", "Mixed", "Sclerotic")]
+      if (length(x)) x[1] else "Berden class unavailable"
+    },
+    rituximab_used = any_flagged(inductiontreatmentType_Rituximab),
+    cyclophosphamide_used = any(
+      trimws(as.character(inductiontreatmentType_Cyclophosphamide)) == "Checked" |
+        trimws(as.character(
+          inductiontreatmentType_.Daily.Oral.Cyclophosphamide
+        )) == "Checked",
+      na.rm = TRUE
+    ),
+    oral_corticosteroids = any_flagged(inductiontreatmentType_Oral.corticosteroids),
+    pulsed_iv_corticosteroids = any_flagged(
+      inductiontreatmentType_.Pulsed.IV.corticosteroids
+    ),
+    plasma_exchange = any_flagged(inductiontreatmentType_Plasma.exchange),
+    across(all_of(organ_cols), any_flagged),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    induction_treatment = case_when(
+      cyclophosphamide_used & !rituximab_used ~ "Cyclophosphamide",
+      rituximab_used & !cyclophosphamide_used ~ "Rituximab",
+      TRUE ~ "Other"
+    )
+  )
+
+cohort3 <- cohort3_ids %>%
+  left_join(cohort3_features, by = "RKD.ID") %>%
+  left_join(cohort3_baseline, by = "RKD.ID") %>%
+  mutate(
+    cluster_label = factor(
+      cluster_label, levels = c("Recovered group", "Static group")
+    ),
+    sex = factor(sex, levels = c("Female", "Male")),
+    anca_specificity = factor(
+      anca_specificity, levels = c("MPO", "PR3", "Other")
+    ),
+    diagnosis = factor(diagnosis, levels = c("MPA", "GPA")),
+    berden_class = factor(
+      berden_class,
+      levels = c(
+        "Crescentic", "Focal", "Mixed", "Sclerotic",
+        "Berden class unavailable"
+      )
+    ),
+    induction_treatment = factor(
+      induction_treatment,
+      levels = c("Cyclophosphamide", "Rituximab", "Other")
+    )
+  )
+
+cohort3_groups <- c("Overall", "Recovered group", "Static group")
+cohort3_n <- c(
+  Overall = nrow(cohort3),
+  `Recovered group` = sum(cohort3$cluster_label == "Recovered group"),
+  `Static group` = sum(cohort3$cluster_label == "Static group")
+)
+cohort3_group_columns <- setNames(
+  sprintf("%s (N = %d)", cohort3_groups, cohort3_n[cohort3_groups]),
+  cohort3_groups
+)
+
+c3_subset <- function(group) {
+  if (group == "Overall") cohort3 else filter(cohort3, cluster_label == group)
+}
+c3_median_iqr <- function(data, variable, digits = 1) {
+  x <- data[[variable]]
+  x <- x[is.finite(x)]
+  if (!length(x)) return("")
+  q <- quantile(x, c(0.25, 0.5, 0.75), names = FALSE)
+  sprintf(
+    paste0("%.", digits, "f (%.", digits, "f-%.", digits, "f)"),
+    q[2], q[1], q[3]
+  )
+}
+c3_n_pct <- function(data, variable, level = TRUE, denominator = NULL) {
+  x <- data[[variable]]
+  if (is.null(denominator)) denominator <- sum(!is.na(x))
+  n <- sum(x == level, na.rm = TRUE)
+  if (!denominator) return("")
+  sprintf("%d/%d (%.1f%%)", n, denominator, 100 * n / denominator)
+}
+c3_p <- function(p) if (is.na(p)) "" else format_p(p)
+c3_values <- function(formatter) {
+  formatter <- rlang::as_function(formatter)
+  setNames(
+    vapply(cohort3_groups, function(g) formatter(c3_subset(g)), character(1)),
+    cohort3_group_columns
+  )
+}
+c3_row <- function(section, variable, values, p = "") {
+  bind_cols(
+    tibble(Section = section, Variable = variable),
+    tibble::as_tibble_row(values),
+    tibble(`P value` = p)
+  )
+}
+c3_continuous <- function(section, label, variable, digits = 1) {
+  c3_row(
+    section, label,
+    c3_values(~ c3_median_iqr(.x, variable, digits)),
+    c3_p(wilcox_p(cohort3[[variable]], cohort3$cluster_label))
+  )
+}
+c3_binary <- function(section, label, variable, level = TRUE) {
+  c3_row(
+    section, label,
+    c3_values(~ c3_n_pct(.x, variable, level)),
+    c3_p(fisher_p(cohort3[[variable]], cohort3$cluster_label))
+  )
+}
+c3_factor_header <- function(section, label, variable, data = cohort3) {
+  c3_row(
+    section, label, setNames(rep("", 3), cohort3_group_columns),
+    c3_p(fisher_p(data[[variable]], data$cluster_label))
+  )
+}
+c3_factor_level <- function(section, label, variable, level) {
+  c3_row(
+    section, paste0("  ", label),
+    c3_values(~ c3_n_pct(.x, variable, level))
+  )
+}
+c3_berden <- function(data, level) {
+  denominator <- if (level == "Berden class unavailable") {
+    nrow(data)
+  } else {
+    sum(!is.na(data$berden_class) &
+          data$berden_class != "Berden class unavailable")
+  }
+  c3_n_pct(data, "berden_class", level, denominator)
+}
+
+c3_berden_available <- cohort3 %>%
+  filter(berden_class != "Berden class unavailable") %>%
+  droplevels()
+c3_has_berden <- cohort3$berden_class != "Berden class unavailable"
+
+cohort3_table <- bind_rows(
+  c3_continuous("Demographic characteristics", "Age at diagnosis, years", "age_at_diagnosis"),
+  c3_binary("Demographic characteristics", "Female sex", "sex", "Female"),
+  c3_factor_header("Disease characteristics", "Clinical diagnosis", "diagnosis"),
+  c3_factor_level("Disease characteristics", "MPA", "diagnosis", "MPA"),
+  c3_factor_level("Disease characteristics", "GPA", "diagnosis", "GPA"),
+  c3_factor_header("Disease characteristics", "ANCA specificity", "anca_specificity"),
+  c3_factor_level("Disease characteristics", "MPO-ANCA", "anca_specificity", "MPO"),
+  c3_factor_level("Disease characteristics", "PR3-ANCA", "anca_specificity", "PR3"),
+  c3_factor_level("Disease characteristics", "Other ANCA result*", "anca_specificity", "Other"),
+  c3_binary("Organ/system involvement (ever recorded)", "Constitutional", "affectedOrgan_General"),
+  c3_binary("Organ/system involvement (ever recorded)", "Cutaneous", "affectedOrgan_Cutaneous"),
+  c3_binary("Organ/system involvement (ever recorded)", "Mucous membrane/ocular", "affectedOrgan_Mucous_membranes_eyes"),
+  c3_binary("Organ/system involvement (ever recorded)", "Ear, nose, and throat", "affectedOrgan_ENT"),
+  c3_binary("Organ/system involvement (ever recorded)", "Pulmonary", "affectedOrgan_Chest"),
+  c3_binary("Organ/system involvement (ever recorded)", "Cardiovascular", "affectedOrgan_Cardiovascular"),
+  c3_binary("Organ/system involvement (ever recorded)", "Gastrointestinal", "affectedOrgan_Abdominal"),
+  c3_binary("Organ/system involvement (ever recorded)", "Neurological", "affectedOrgan_Nervous_system"),
+  c3_binary("Organ/system involvement (ever recorded)", "Renal", "affectedOrgan_Renal"),
+  c3_binary("Organ/system involvement (ever recorded)", "Other recorded system involvement**", "affectedOrgan_Other"),
+  c3_continuous("Kidney characteristics", "Baseline serum creatinine, µmol/L", "baseline_creatinine", 0),
+  c3_continuous("Kidney characteristics", "Baseline eGFR, mL/min/1.73 m²", "baseline_eGFR", 0),
+  c3_binary("Kidney characteristics", "Dialysis-dependent at baseline", "baseline_dialysis_dependent"),
+  c3_factor_header(
+    "Kidney histology", "Berden histological class", "berden_class",
+    c3_berden_available
+  ),
+  c3_row("Kidney histology", "  Crescentic", c3_values(~ c3_berden(.x, "Crescentic"))),
+  c3_row("Kidney histology", "  Focal", c3_values(~ c3_berden(.x, "Focal"))),
+  c3_row("Kidney histology", "  Mixed", c3_values(~ c3_berden(.x, "Mixed"))),
+  c3_row("Kidney histology", "  Sclerotic", c3_values(~ c3_berden(.x, "Sclerotic"))),
+  c3_row(
+    "Kidney histology", "Berden class unavailable",
+    c3_values(~ c3_berden(.x, "Berden class unavailable")),
+    c3_p(fisher_p(c3_has_berden, cohort3$cluster_label))
+  ),
+  c3_factor_header("Induction treatment", "Recorded induction regimen", "induction_treatment"),
+  c3_factor_level("Induction treatment", "Cyclophosphamide only", "induction_treatment", "Cyclophosphamide"),
+  c3_factor_level("Induction treatment", "Rituximab only", "induction_treatment", "Rituximab"),
+  c3_factor_level("Induction treatment", "Combined CYC + RTX or other induction***", "induction_treatment", "Other"),
+  c3_binary("Induction treatment", "Oral corticosteroids", "oral_corticosteroids"),
+  c3_binary("Induction treatment", "Pulsed intravenous corticosteroids", "pulsed_iv_corticosteroids"),
+  c3_binary("Induction treatment", "Plasma exchange", "plasma_exchange"),
+  c3_continuous("Post-peak analysis", "T1, months after diagnosis", "T1_month"),
+  c3_continuous("Post-peak analysis", "eGFR at T1, mL/min/1.73 m²", "T1_eGFR", 0),
+  c3_continuous("Post-peak analysis", "Included eGFR measurement dates from T1, n", "n_slope_visits", 0),
+  c3_continuous("Post-peak analysis", "Span from T1 to last included eGFR measurement, years", "maximum_followup_from_T1_years")
+)
+
+cohort3_notes <- c(
+  "Characteristics of Cohort 3 (the post-peak eGFR slope analysis subset of Cohort 2), overall and by early eGFR recovery group.",
+  "Values are median (interquartile range) or n/N (%), where N is the number with available data unless otherwise stated.",
+  "For dialysis-dependent visits, eGFR was assigned 3 mL/min/1.73 m² before baseline and T1 selection; serum creatinine was assigned 500 µmol/L before baseline selection.",
+  "The four Berden-class percentages use patients with an available class as the denominator (overall N=110; Recovered N=41; Static N=69); the unavailable row uses the full group denominator.",
+  "* Other ANCA result comprises two ELISA-negative and two dual MPO/PR3 results.",
+  "** Other recorded system involvement comprises peripheral vascular disease with gangrenous toes/amputation, a constitutional entry, and a mediastinal mass.",
+  "*** This category comprises 13 patients who received both cyclophosphamide and rituximab and four who received another induction agent (three azathioprine and one mycophenolate mofetil).",
+  "T1 is the earliest occurrence of the highest available eGFR between 4 and 12 months after diagnosis, after endpoint/date filtering and same-day record collapse.",
+  "Slope-model eligibility required T1 and at least one later eGFR measurement on a distinct date; measurements from T1 through 60 months after diagnosis were included.",
+  "P values compare the Recovered and Static groups using Wilcoxon rank-sum or Fisher's exact tests; they are descriptive, unadjusted, and were not corrected for multiple comparisons."
+)
+
+save_table(cohort3, "post_peak_egfr_slope/cohort3_post_peak_patient_level.csv")
+save_table(
+  cohort3_table,
+  "post_peak_egfr_slope/cohort3_post_peak_characteristics_table.csv"
+)
+save_table(
+  cohort3_table %>% filter(Section != "Post-peak analysis"),
+  "post_peak_egfr_slope/cohort3_post_peak_baseline_characteristics.csv"
+)
+save_table(
+  cohort3_table %>% filter(Section == "Post-peak analysis"),
+  "post_peak_egfr_slope/cohort3_post_peak_analysis_characteristics.csv"
+)
+writeLines(
+  cohort3_notes,
+  file.path(slope_output_dir, "cohort3_post_peak_table_notes.txt"),
+  useBytes = TRUE
+)
+
+stopifnot(
+  nrow(cohort3) == 148L,
+  sum(cohort3$cluster_label == "Recovered group") == 58L,
+  sum(cohort3$cluster_label == "Static group") == 90L,
+  nrow(cohort3_table) == 39L,
+  !any(is.na(cohort3$baseline_eGFR))
+)
+print(cohort3_table, n = Inf, width = Inf)
+```
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## 6. Supplementary full and RETRACE-excluded CIFs
+
+```{r supplementary-full-and-excluded-cif, fig.width=12, fig.height=5.5}
+# This analysis is descriptive: the excluded cohort is a subset of the full
+# cohort, so the panels must not be compared with a between-group test.
+cif_followup_years <- 5
+prediagnosis_eskd_policy <- "time_zero"
+stopifnot(prediagnosis_eskd_policy %in% c("time_zero", "exclude", "stop"))
+
+cif_output_dir <- file.path(output_dir, "cif_full_and_excluded")
+dir.create(cif_output_dir, recursive = TRUE, showWarnings = FALSE)
+
+full_cif_fields <- c(
+  "dateOfDiagnosis", "dateOfESKD", "dateOfDeath",
+  "lastRecordedContact", "ESKDStandard", "death"
+)
+assert_columns(Full_cohort, full_cif_fields)
+
+# Confirm patient-level dates/statuses do not conflict across visit rows.
+full_cif_field_audit <- Full_cohort %>%
+  filter(!is.na(RKD.ID)) %>%
+  group_by(RKD.ID) %>%
+  summarise(
+    across(
+      all_of(full_cif_fields),
+      ~ n_distinct(.x[!is.na(.x) & trimws(as.character(.x)) != ""]),
+      .names = "n_values_{.col}"
+    ),
+    .groups = "drop"
+  )
+
+full_cif_field_conflicts <- full_cif_field_audit %>%
+  filter(if_any(starts_with("n_values_"), ~ .x > 1))
+write.csv(
+  full_cif_field_conflicts,
+  file.path(cif_output_dir, "CIF_patient_field_conflicts.csv"),
+  row.names = FALSE
+)
+if (nrow(full_cif_field_conflicts)) {
+  stop("Conflicting patient-level CIF fields; review CIF_patient_field_conflicts.csv.")
+}
+
+full_cif_patient <- Full_cohort %>%
+  filter(!is.na(RKD.ID)) %>%
+  arrange(RKD.ID, Interval.from.diagnosis..months., Date.Of.Visit) %>%
+  group_by(RKD.ID) %>%
+  summarise(across(all_of(full_cif_fields), first_nonblank), .groups = "drop")
+
+retrace_cif_ids <- RESULT_crr$RKD.ID
+stopifnot(
+  !anyDuplicated(retrace_cif_ids),
+  all(retrace_cif_ids %in% full_cif_patient$RKD.ID)
+)
+
+full_cif_patient <- full_cif_patient %>%
+  mutate(
+    trajectory_eligibility = factor(
+      if_else(RKD.ID %in% retrace_cif_ids, "RETRACE included", "RETRACE excluded"),
+      levels = c("RETRACE included", "RETRACE excluded")
+    ),
+    eskd_flag = coalesce(toupper(trimws(ESKDStandard)) == "YES", FALSE),
+    death_flag = coalesce(toupper(trimws(death)) == "DEAD", FALSE),
+    days_to_eskd_raw = as.numeric(dateOfESKD - dateOfDiagnosis),
+    days_to_death_raw = as.numeric(dateOfDeath - dateOfDiagnosis),
+    days_to_censor_raw = as.numeric(lastRecordedContact - dateOfDiagnosis),
+    prediagnosis_eskd = eskd_flag & !is.na(days_to_eskd_raw) & days_to_eskd_raw < 0,
+    eskd_after_last_contact = eskd_flag &
+      !is.na(dateOfESKD) & !is.na(lastRecordedContact) &
+      dateOfESKD > lastRecordedContact
+  )
+
+prediagnosis_eskd_records <- full_cif_patient %>%
+  filter(prediagnosis_eskd) %>%
+  select(
+    RKD.ID, trajectory_eligibility,
+    dateOfDiagnosis, dateOfESKD, days_to_eskd_raw
+  )
+write.csv(
+  prediagnosis_eskd_records,
+  file.path(cif_output_dir, "CIF_prediagnosis_ESKD_audit.csv"),
+  row.names = FALSE
+)
+if (prediagnosis_eskd_policy == "stop" && nrow(prediagnosis_eskd_records)) {
+  stop("ESKD dates before diagnosis require adjudication.")
+}
+
+full_cif_patient <- full_cif_patient %>%
+  mutate(
+    days_to_eskd_used = case_when(
+      prediagnosis_eskd & prediagnosis_eskd_policy == "time_zero" ~ 0,
+      prediagnosis_eskd ~ NA_real_,
+      TRUE ~ days_to_eskd_raw
+    ),
+    time_to_eskd_days = if_else(
+      eskd_flag & !is.na(days_to_eskd_used) & days_to_eskd_used >= 0,
+      days_to_eskd_used, Inf
+    ),
+    time_to_death_days = if_else(
+      death_flag & !is.na(days_to_death_raw) & days_to_death_raw >= 0,
+      days_to_death_raw, Inf
+    ),
+    time_to_censor_days = if_else(
+      !is.na(days_to_censor_raw) & days_to_censor_raw >= 0,
+      days_to_censor_raw, Inf
+    ),
+    first_time_days = pmin(
+      time_to_eskd_days, time_to_death_days, time_to_censor_days
+    ),
+    exclusion_reason = case_when(
+      is.na(dateOfDiagnosis) ~ "Missing diagnosis date",
+      eskd_flag & is.na(dateOfESKD) ~ "ESKD status without ESKD date",
+      death_flag & is.na(dateOfDeath) ~ "Death status without death date",
+      !is.na(days_to_death_raw) & days_to_death_raw < 0 ~ "Death date before diagnosis",
+      !is.na(days_to_censor_raw) & days_to_censor_raw < 0 ~ "Last contact before diagnosis",
+      prediagnosis_eskd & prediagnosis_eskd_policy == "exclude" ~ "ESKD before diagnosis",
+      !is.finite(first_time_days) ~ "No valid outcome follow-up",
+      TRUE ~ NA_character_
+    ),
+    status_raw = case_when(
+      !is.finite(first_time_days) ~ NA_integer_,
+      time_to_eskd_days <= time_to_death_days &
+        time_to_eskd_days <= time_to_censor_days ~ 1L,
+      time_to_death_days < time_to_eskd_days &
+        time_to_death_days <= time_to_censor_days ~ 2L,
+      TRUE ~ 0L
+    ),
+    status = if_else(
+      first_time_days > cif_followup_years * 365.25, 0L, status_raw
+    ),
+    time = pmin(first_time_days / 365.25, cif_followup_years)
+  )
+
+full_cif_quality_audit <- full_cif_patient %>%
+  filter(
+    is.na(dateOfDiagnosis) | prediagnosis_eskd | eskd_after_last_contact |
+      (!is.na(days_to_death_raw) & days_to_death_raw < 0) |
+      (!is.na(days_to_censor_raw) & days_to_censor_raw < 0) |
+      !is.na(exclusion_reason)
+  ) %>%
+  select(
+    RKD.ID, trajectory_eligibility,
+    dateOfDiagnosis, dateOfESKD, dateOfDeath, lastRecordedContact,
+    days_to_eskd_raw, days_to_death_raw, days_to_censor_raw,
+    prediagnosis_eskd, eskd_after_last_contact, exclusion_reason
+  )
+
+full_cif_disposition <- full_cif_patient %>%
+  mutate(CIF_disposition = coalesce(exclusion_reason, "Included in CIF")) %>%
+  count(trajectory_eligibility, CIF_disposition, name = "n")
+
+write.csv(
+  full_cif_quality_audit,
+  file.path(cif_output_dir, "CIF_patient_level_data_quality_audit.csv"),
+  row.names = FALSE
+)
+write.csv(
+  full_cif_disposition,
+  file.path(cif_output_dir, "CIF_analysis_disposition.csv"),
+  row.names = FALSE
+)
+
+full_cif_analysis <- full_cif_patient %>%
+  filter(is.na(exclusion_reason), is.finite(time), !is.na(status))
+excluded_cif_analysis <- full_cif_analysis %>%
+  filter(trajectory_eligibility == "RETRACE excluded")
+
+fit_single_cif <- function(data) {
+  if (!any(data$status == 1L)) stop("A plotted cohort has no ESKD events.")
+  cmprsk::cuminc(data$time, data$status, cencode = 0)
+}
+
+full_cif_curves <- bind_rows(
+  tidy_cuminc(fit_single_cif(full_cif_analysis), 1L, "Full cohort"),
+  tidy_cuminc(fit_single_cif(excluded_cif_analysis), 1L, "RETRACE excluded")
+)
+
+full_cif_summary <- extract_cif_times(full_cif_curves) %>%
+  mutate(across(c(estimate, lower, upper), ~ 100 * .x, .names = "{.col}_percent"))
+
+full_cif_outcome_counts <- bind_rows(
+  full_cif_analysis %>%
+    summarise(
+      population = "Full cohort", N = n(),
+      ESKD_events = sum(status == 1L),
+      competing_deaths = sum(status == 2L),
+      censored = sum(status == 0L)
+    ),
+  full_cif_analysis %>%
+    group_by(trajectory_eligibility) %>%
+    summarise(
+      population = as.character(first(trajectory_eligibility)), N = n(),
+      ESKD_events = sum(status == 1L),
+      competing_deaths = sum(status == 2L),
+      censored = sum(status == 0L),
+      .groups = "drop"
+    ) %>%
+    select(-trajectory_eligibility)
+)
+
+write.csv(
+  full_cif_curves %>% select(population, time, estimate, lower, upper),
+  file.path(cif_output_dir, "CIF_curve_coordinates.csv"),
+  row.names = FALSE
+)
+write.csv(
+  full_cif_summary,
+  file.path(cif_output_dir, "CIF_summary_1_3_5_years.csv"),
+  row.names = FALSE
+)
+write.csv(
+  full_cif_outcome_counts,
+  file.path(cif_output_dir, "CIF_outcome_counts.csv"),
+  row.names = FALSE
+)
+
+full_source_n <- nrow(full_cif_patient)
+full_analysis_n <- nrow(full_cif_analysis)
+excluded_source_n <- sum(full_cif_patient$trajectory_eligibility == "RETRACE excluded")
+excluded_analysis_n <- nrow(excluded_cif_analysis)
+
+cif_y_upper <- min(
+  1,
+  max(0.25, ceiling(max(full_cif_curves$upper, na.rm = TRUE) / 0.05) * 0.05)
+)
+
+make_cif_panel <- function(population_value, colour, title) {
+  ggplot(
+    full_cif_curves %>% filter(.data$population == .env$population_value),
+    aes(time, estimate)
+  ) +
+    geom_ribbon(
+      aes(ymin = lower, ymax = upper),
+      fill = colour, alpha = 0.14, colour = NA
+    ) +
+    geom_step(linewidth = 1.05, colour = colour) +
+    coord_cartesian(
+      xlim = c(0, cif_followup_years),
+      ylim = c(0, cif_y_upper),
+      expand = FALSE
+    ) +
+    scale_x_continuous(breaks = 0:cif_followup_years) +
+    scale_y_continuous(
+      breaks = seq(0, cif_y_upper, by = 0.05),
+      labels = scales::percent_format(accuracy = 1)
+    ) +
+    labs(
+      title = title,
+      x = "Time in years since diagnosis",
+      y = "Cumulative incidence of ESKD"
+    ) +
+    theme_manuscript(base_size = 12, legend = "none") +
+    theme(plot.title = element_text(face = "bold", size = 13, hjust = 0))
+}
+
+p_full_cohort_cif <- make_cif_panel(
+  "Full cohort", "grey20",
+  sprintf("A. Full cohort (n = %d/%d analyzable)", full_analysis_n, full_source_n)
+)
+p_excluded_cohort_cif <- make_cif_panel(
+  "RETRACE excluded", "#D55E00",
+  sprintf(
+    "B. RETRACE-excluded cohort (n = %d/%d analyzable)",
+    excluded_analysis_n, excluded_source_n
+  )
+)
+
+combined_full_excluded_cif <-
+  (p_full_cohort_cif | p_excluded_cohort_cif) +
+  plot_annotation(
+    title = "Cumulative incidence of ESKD",
+    subtitle = "Death was treated as a competing event",
+    caption = paste0(
+      nrow(prediagnosis_eskd_records),
+      " pre-diagnosis ESKD records are displayed as time-zero events; ",
+      sum(!is.na(full_cif_patient$exclusion_reason)),
+      " patients lacked a valid non-negative analysis time.\n",
+      "Panels are descriptive and populations overlap; no between-panel test was performed."
+    ),
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5),
+      plot.caption = element_text(size = 8.5, hjust = 0)
+    )
+  )
+
+print(combined_full_excluded_cif)
+ggsave(
+  file.path(cif_output_dir, "Supplementary_CIF_full_and_excluded.png"),
+  combined_full_excluded_cif, width = 12, height = 5.5, dpi = 600, bg = "white"
+)
+ggsave(
+  file.path(cif_output_dir, "Supplementary_CIF_full_and_excluded.pdf"),
+  combined_full_excluded_cif, width = 12, height = 5.5, bg = "white"
+)
+
+stopifnot(
+  full_source_n == 742L,
+  full_analysis_n == 739L,
+  excluded_source_n == 508L,
+  excluded_analysis_n == 505L,
+  nrow(prediagnosis_eskd_records) == 11L,
+  nrow(full_cif_field_conflicts) == 0L
+)
+
+print(full_cif_outcome_counts)
+print(full_cif_summary)
+print(full_cif_disposition)
+```
+
+## 7. Berden distribution
+
+```{r berden-figure, fig.width=7.2, fig.height=5.2}
+berden_data <- RESULT_crr %>%
+  transmute(
+    cluster_label,
+    Berden = factor(
+      standardize_berden(Berden.score.on.renal.biopsy),
+      levels = berden_levels
+    )
+  )
+
+berden_tab <- with(berden_data, table(cluster_label, Berden))
+berden_available_tab <- berden_tab[, setdiff(colnames(berden_tab), "Missing"), drop = FALSE]
+if (nrow(berden_available_tab) >= 2 && ncol(berden_available_tab) >= 2) {
+  set.seed(123)
+  print(fisher.test(berden_available_tab, simulate.p.value = TRUE, B = 10000))
+}
+
+# Missingness is tested from patient-level rows, not from already aggregated
+# category rows.
+berden_missing_tab <- with(
+  berden_data,
+  table(cluster_label, Berden_missing = Berden == "Missing" | is.na(Berden))
+)
+print(berden_missing_tab)
+if (all(dim(berden_missing_tab) >= 2)) print(fisher.test(berden_missing_tab))
+
+berden_plot_data <- berden_data %>%
+  count(cluster_label, Berden, .drop = FALSE, name = "n") %>%
+  group_by(cluster_label) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup()
+
+p_berden <- ggplot(
+  berden_plot_data,
+  aes(cluster_label, proportion, fill = Berden)
+) +
+  geom_col() +
+  geom_text(
+    aes(label = if_else(proportion > 0, scales::percent(proportion, accuracy = 1), "")),
+    position = position_stack(vjust = 0.5),
+    size = 4.2
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = berden_cols, drop = FALSE) +
+  labs(
+    title = "Berden biopsy class distribution",
+    x = NULL,
+    y = "Proportion",
+    fill = "Berden biopsy class"
+  ) +
+  theme_manuscript(legend = "right") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 15),
+    legend.title = element_text(face = "bold")
+  )
+
+print(p_berden)
+save_plot(p_berden, "Figure_3_Berden_distribution.png", 7.2, 5.2)
+```
+
+## 8. Supplementary tables and exported clustering data
+
+```{r supplementary-tables}
+summarise_characteristics <- function(data, groups = character()) {
+  if (length(groups)) data <- data %>% group_by(across(all_of(groups)))
+  data %>%
+    summarise(
+      N = n(),
+      mean_age = round(median(ageAtDiagnosis, na.rm = TRUE), 1),
+      age_q1 = round(quantile(ageAtDiagnosis, 0.25, na.rm = TRUE), 1),
+      age_q3 = round(quantile(ageAtDiagnosis, 0.75, na.rm = TRUE), 1),
+      female_n = sum(gender == "Female", na.rm = TRUE),
+      mean_creatinine = round(median(creatininetest1, na.rm = TRUE), 0),
+      creatinine_q1 = round(quantile(creatininetest1, 0.25, na.rm = TRUE), 0),
+      creatinine_q3 = round(quantile(creatininetest1, 0.75, na.rm = TRUE), 0),
+      mean_egfr = round(median(eGFR1, na.rm = TRUE), 0),
+      egfr_q1 = round(quantile(eGFR1, 0.25, na.rm = TRUE), 0),
+      egfr_q3 = round(quantile(eGFR1, 0.75, na.rm = TRUE), 0),
+      MPA_n = sum(DefiniteMPA == 1, na.rm = TRUE),
+      GPA_n = sum(DefiniteGPA == 1, na.rm = TRUE),
+      Berden_Crescentic = sum(Berden.score.on.renal.biopsy == "Crescentic", na.rm = TRUE),
+      Berden_Focal = sum(Berden.score.on.renal.biopsy == "Focal", na.rm = TRUE),
+      Berden_Mixed = sum(Berden.score.on.renal.biopsy == "Mixed", na.rm = TRUE),
+      Berden_Sclerotic = sum(Berden.score.on.renal.biopsy == "Sclerotic", na.rm = TRUE),
+      Berden_Missing = sum(Berden.score.on.renal.biopsy == "Missing", na.rm = TRUE),
+      MPO_n = sum(ancaSpec == "MPO", na.rm = TRUE),
+      PR3_n = sum(ancaSpec == "PR3", na.rm = TRUE),
+      Other_n = sum(ancaSpec == "Other", na.rm = TRUE),
+      Ind_Cyclo = sum(inductionFinal == "Cyclo", na.rm = TRUE),
+      Ind_Rituximab = sum(inductionFinal == "Rituximab", na.rm = TRUE),
+      Ind_Others = sum(inductionFinal == "Other", na.rm = TRUE),
+      Dialysis_dependent_n = sum(Dialysis.dependent == "Yes", na.rm = TRUE),
+      Corti_Oral = sum(
+        inductiontreatmentType_Oral.corticosteroids == "Oral.Steroids",
+        na.rm = TRUE
+      ),
+      Corti_Intra = sum(
+        inductiontreatmentType_.Pulsed.IV.corticosteroids == "IV.Steroids",
+        na.rm = TRUE
+      ),
+      Plasma = sum(inductiontreatmentType_Plasma.exchange == "Checked", na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+Full_cohort_unique <- Full_cohort %>%
+  distinct(RKD.ID, .keep_all = TRUE) %>%
+  rename(eGFR1 = egfr_calculated1)
+
+Full_TABLE <- summarise_characteristics(Full_cohort_unique) %>%
+  rename(Ind_other = Ind_Others)
+
+Ect_data_unique <- Ect_data %>%
+  distinct(RKD.ID, .keep_all = TRUE) %>%
+  mutate(inductionFinal = as.character(inductionFinal))
+
+ECT_TABLE <- bind_rows(
+  Ect_data_unique,
+  Ect_data_unique %>% mutate(inductionFinal = "Overall")
+) %>%
+  summarise_characteristics("inductionFinal") %>%
+  select(-Ind_Cyclo, -Ind_Rituximab, -Ind_Others) %>%
+  arrange(inductionFinal == "Overall")
+
+RETRACE_summary_source <- bind_rows(
+  RESULT_crr %>% mutate(cluster_label = as.character(cluster_label)),
+  RESULT_crr %>% mutate(cluster_label = "Overall")
+)
+
+RETRACE_TABLE <- summarise_characteristics(RETRACE_summary_source, "cluster_label") %>%
+  left_join(
+    RETRACE_summary_source %>%
+      group_by(cluster_label) %>%
+      summarise(
+        ESKD_n = sum(status == 1L),
+        Death_competing_n = sum(status == 2L),
+        .groups = "drop"
+      ),
+    by = "cluster_label"
+  ) %>%
+  arrange(cluster_label == "Overall")
+
+RETRACE_TABLE_WIDE <- RETRACE_TABLE %>%
+  pivot_longer(-cluster_label, names_to = "Characteristic", values_to = "Value") %>%
+  pivot_wider(names_from = cluster_label, values_from = Value) %>%
+  relocate(Overall, .after = last_col())
+
+# Preserve the original Table 3 P-value definitions for compatibility.
+test_data <- RESULT_crr %>%
+  mutate(
+    diagnosis_group = case_when(
+      DefiniteMPA == 1 ~ "MPA",
+      DefiniteGPA == 1 ~ "GPA",
+      TRUE ~ NA_character_
+    ),
+    oral_steroid = inductiontreatmentType_Oral.corticosteroids == "Oral.Steroids",
+    iv_steroid = inductiontreatmentType_.Pulsed.IV.corticosteroids == "IV.Steroids",
+    plasma_exchange = inductiontreatmentType_Plasma.exchange == "Checked"
+  )
+g <- test_data$cluster_label
+
+p_values <- tibble(
+  Characteristic = c(
+    "mean_age", "female_n", "mean_creatinine", "mean_egfr", "MPA_n",
+    "Berden_Crescentic", "MPO_n", "Ind_Cyclo", "Dialysis_dependent_n",
+    "Corti_Oral", "Corti_Intra", "Plasma", "ESKD_n"
+  ),
+  p_raw = c(
+    wilcox_p(test_data$ageAtDiagnosis, g),
+    fisher_p(test_data$gender, g),
+    wilcox_p(test_data$creatininetest1, g),
+    wilcox_p(test_data$eGFR1, g),
+    fisher_p(test_data$diagnosis_group, g),
+    fisher_p(test_data$Berden.score.on.renal.biopsy, g),
+    fisher_p(test_data$ancaSpec, g),
+    fisher_p(test_data$inductionFinal, g),
+    fisher_p(test_data$Dialysis.dependent, g),
+    fisher_p(test_data$oral_steroid, g),
+    fisher_p(test_data$iv_steroid, g),
+    fisher_p(test_data$plasma_exchange, g),
+    fisher_p(test_data$status, g)
+  )
+) %>%
+  mutate(`P value` = if_else(is.na(p_raw), "", vapply(p_raw, format_p, character(1))))
+
+RETRACE_TABLE_WIDE <- RETRACE_TABLE_WIDE %>%
+  left_join(p_values %>% select(Characteristic, `P value`), by = "Characteristic") %>%
+  relocate(`P value`, .after = last_col())
+
+save_table(Full_TABLE, "supplementary_table_1_full_cohort_egfr.csv")
+save_table(ECT_TABLE, "supplementary_table_2_ECT_cohort_egfr.csv")
+save_table(RETRACE_TABLE, "supplementary_table_3_RETRACE_cohort_egfr.csv")
+save_table(
+  RETRACE_TABLE_WIDE,
+  "supplementary_table_3_RETRACE_cohort_egfr_wide_with_p_values.csv"
+)
+
+print(Full_TABLE)
+print(ECT_TABLE)
+print(RETRACE_TABLE_WIDE)
+```
+
+```{r cluster-centroids}
+cluster_centroids_long <- Data_wide %>%
+  transmute(
+    RKD.ID,
+    cluster_label = as.character(cluster_label),
+    time_bin,
+    eGFR_change = num_clean(mean)
+  ) %>%
+  group_by(RKD.ID, cluster_label, time_bin) %>%
+  summarise(
+    eGFR_change = if (all(is.na(eGFR_change))) NA_real_ else mean(eGFR_change, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(cluster_label, time_bin) %>%
+  summarise(
+    centroid = mean(eGFR_change, na.rm = TRUE),
+    n_available = sum(!is.na(eGFR_change)),
+    .groups = "drop"
+  ) %>%
+  mutate(centroid = if_else(is.nan(centroid), NA_real_, centroid)) %>%
+  arrange(cluster_label, time_bin)
+
+cluster_centroids_wide <- cluster_centroids_long %>%
+  select(cluster_label, time_bin, centroid) %>%
+  mutate(time_bin = paste0("month_bin_", time_bin)) %>%
+  pivot_wider(names_from = time_bin, values_from = centroid)
+
+save_table(cluster_centroids_long, "eGFR_cluster_centroids_long.csv")
+save_table(cluster_centroids_wide, "eGFR_cluster_centroids_wide.csv")
+save_table(kml_wide, "kml_input.csv")
+```
+
