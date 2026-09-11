@@ -1,0 +1,111 @@
+---
+title: "eGFR workflow"
+author: "Shen Jia"
+date: "2026-07-01"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+params:
+  project_root: "."
+  data_path: "data/harmonized_data.csv"
+  output_dir: "outputs/interactive_run"
+---
+
+```{r load-analysis-code, include=FALSE}
+# kml imports rgl; use its headless device when this report is rendered without
+# a graphical display.
+options(rgl.useNULL = TRUE)
+
+# The step files contain publication labels such as µ, ², and en dashes.
+# Set the character locale before knitr reads and parses those files.
+if (!isTRUE(l10n_info()[["UTF-8"]])) {
+  for (locale_name in c("en_US.UTF-8", "C.UTF-8", "C.utf8")) {
+    suppressWarnings(try(Sys.setlocale("LC_CTYPE", locale_name), silent = TRUE))
+    if (isTRUE(l10n_info()[["UTF-8"]])) break
+  }
+}
+if (!isTRUE(l10n_info()[["UTF-8"]])) {
+  warning("No UTF-8 locale is available; non-ASCII labels may be escaped.")
+}
+
+project_root <- normalizePath(params$project_root, mustWork = TRUE)
+knitr::opts_knit$set(root.dir = project_root)
+step_files <- sort(list.files(file.path(project_root, "analysis", "steps"),
+                              pattern = "[.]R$", full.names = TRUE))
+read_step <- knitr::read_chunk
+for (step_file in step_files) read_step(step_file)
+```
+
+Run the analysis in the order shown below. Code is loaded from `analysis/steps/`; shared functions are in `R/analysis_helpers.R`.
+```{r setup, message=FALSE, warning=FALSE}
+```
+```{r analysis-paths}
+```
+## 1. Load, filter, and clean the data
+Select the analysis variables and derive the full AAV cohort.
+
+```{r load-filter-clean}
+```
+## 2. Derive the early renal recovery cohort (Cohort 1)
+
+```{r cohort-derivation}
+```
+## 3. Early eGFR recovery analysis in Cohort 1
+
+Model change in eGFR during the first six months after diagnosis using mixed-effects models with prespecified covariates.
+
+```{r ect-models}
+```
+```{r ect-figures, fig.width=7.2, fig.height=8.5}
+```
+## 4. Identification of early eGFR recovery groups (Cohort 2)
+
+```{r retrace-kml}
+```
+```{r cluster-selection-figure, fig.width=7.4, fig.height=4.6}
+```
+```{r trajectory-figure, fig.width=7.2, fig.height=5.2}
+```
+## 5. RETRACE outcome analysis
+
+```{r fine-gray-models}
+```
+```{r retrace-cif, fig.width=7.2, fig.height=5.35}
+```
+
+## 6. Post-peak eGFR slope analysis set (Cohort 3)
+
+T1 is the earliest occurrence of the highest available eGFR between 4 and 12
+months after diagnosis. Dialysis-dependent visits are assigned an eGFR of 3
+mL/min/1.73 m². Measurements from T1 through 60 months after diagnosis are
+retained, including measurements after ESKD; follow-up ends at transplantation,
+death, or last recorded contact. Eligibility requires T1 and at least one later
+eGFR measurement on a distinct date.
+
+```{r post-peak-slope-data}
+```
+```{r post-peak-slope-model-and-figures, fig.width=10.8, fig.height=10.3}
+```
+### Cohort 3 characteristics
+
+```{r cohort3-characteristics-table}
+```
+## 7. Supplementary full and RETRACE-excluded CIFs
+
+This analysis is descriptive: the excluded cohort is a subset of the full
+cohort, so the panels must not be compared with a between-group test.
+
+```{r supplementary-full-and-excluded-cif, fig.width=12, fig.height=5.5}
+```
+## 8. Berden distribution
+
+```{r berden-figure, fig.width=7.2, fig.height=5.2}
+```
+
+## 9. Supplementary tables and exported clustering data
+
+```{r supplementary-tables}
+```
+```{r cluster-centroids}
+```
